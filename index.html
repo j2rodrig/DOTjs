@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+
+	<script src="compiler.js"></script>
+
+	<style type="text/css">
+	textarea {
+		font-family: "Courier New", Courier, monospace;
+		font-size: 1.2em;
+		-moz-tab-size: 4;
+		-o-tab-size: 4;
+		tab-size: 4;
+	}
+	body {
+		font-size: 100%;
+	}
+	</style>
+
+	<script>
+	/// Toggles the visibility of a DOM element.
+	function toggle(id) {
+		var elem = document.getElementById(id);
+		if (elem.style.display == "none")
+			elem.style.display = "block";
+		else
+			elem.style.display = "none";
+	}
+	</script>
+
+	<script>
+	/// Function that allows tabs in all textareas.
+	/// See: http://stackoverflow.com/questions/6637341/use-tab-to-indent-in-textarea
+	function allowTabsInTextareas() {
+		var textareas = document.getElementsByTagName('textarea');
+		var count = textareas.length;
+		for(var i=0;i<count;i++){
+		    textareas[i].onkeydown = function(e){
+		        if(e.keyCode==9 || e.which==9){
+		            e.preventDefault();
+		            var s = this.selectionStart;
+		            this.value = this.value.substring(0,this.selectionStart) + "\t" + this.value.substring(this.selectionEnd);
+		            this.selectionEnd = s+1; 
+		        }
+		    }
+		}
+	}
+	</script>
+
+</head>
+<body onload="allowTabsInTextareas()">
+
+	<div style="display: inline-block; vertical-align:top; width:49%;">
+
+		<h1 style="display:inline-block;width:46%">DOTjs</h1>
+		<div style="display:inline-block;width:46%;text-align:right">
+			<button style="font-size:1em" onclick="toggle('referencePane')">Quick Reference</button>
+		</div>
+	</div>
+
+	<div style="display: inline-block; vertical-align:top; width:49%">
+		<h1>Javascript</h1>
+	</div>
+
+	<div id="referencePane" style="display:none">
+		<h2>Syntax</h2>
+		<p>id ::= a term identifier (begins with a lower-case letter)</p>
+		<p>ID ::= a type identifier (begins with an upper-case letter)</p>
+		<p></p>
+	</div>
+
+	<div style="display: inline-block; vertical-align:top; width:49%">
+		<textarea id="textarea-input" rows=20 style="width:95%;resize:vertical;" autofocus></textarea>
+
+		<h3 style="display:inline-block;width:46%">&nbsp;</h3> <!-- for spacing -->
+		<div style="display:inline-block;width:46%;text-align:right">
+			<button style="font-size:1em"
+				onclick="document.getElementById('textarea-output').value = compile(document.getElementById('textarea-input').value, 'types')">Compile</button>
+		</div>
+	</div>
+
+	<div style="display: inline-block; vertical-align:top; width:49%">
+		<textarea id="textarea-output" readonly=true rows=20 style="width:95%;resize:vertical"></textarea>
+	</div>
+
+</body>
+</html>
