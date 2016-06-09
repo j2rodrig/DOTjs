@@ -16,13 +16,21 @@ window.compile = (input, stopAfter) ->
 		if stopAfter == "symbols"
 			return debugOutput
 
-		typecheck(ast)
+		summ = getSummary(ast, true)
 
 		if stopAfter == "types"
-			return ast.print(0)
+			return stringifyMembershipSet(summ.typeMembers("UPPER"), 0)
+			# ast.print(0)
 
 	catch error
-		return error.stack
+		return if error.stack then error.stack else error
+
+
+
+
+
+
+
 
 strtyp = (tree, indent) ->
 	output = []
@@ -242,7 +250,7 @@ assignType = (tree) ->
 	tree.typ
 ###
 
-
+###
 membershipOfStatements = (tree) ->
 
 	typeMembers = {}
@@ -259,18 +267,21 @@ membershipOfStatements = (tree) ->
 
 getMembershipOf = (tree) ->
 	if tree.type is "STATEMENTS" then membershipOfStatements(tree)
-
+###
 
 DefaultToken = (tkIn, defaultType, defaultText, defaultLine, defaultColumn) ->
 	if tkIn then tkIn else Token(defaultType, defaultText, defaultLine, defaultColumn)
 
 Token = (tokType, text, line, column) ->
-	return
+	tk =
 		type: tokType
 		match: text
 		line: line
 		column: column
 		isToken: true
+	tk.stringify = () -> tk.match.replace('\n', '\\n')
+	tk.print = () -> "#{tk.type}, \"#{tk.match.replace('\n', '\\n')}\", line #{tk.line}, character #{tk.column}"
+	tk
 
 CreateGlobalContext = () ->
 	context =
@@ -291,6 +302,12 @@ CreateGlobalContext = () ->
 
 	context
 
+stringifyMembershipSet = (mems, indent) ->
+	out = []
+	for id, summary of mems
+		out.push(tabs(indent+1) + id + " : " + summary.tree.stringify(indent+1) + "\n")
+	"{\n" + out.join("") + tabs(indent) + "}"
+
 # I think what we need to do here is be able to take a type (sym info)
 #  and find a list of type/term members. We only expand symbol types as needed.
 # Each member may be defined at most once. If there are multiple definitions
@@ -300,7 +317,62 @@ CreateGlobalContext = () ->
 #  expanded in their original contexts. (Essentially, expansion in the
 #  original context allows mixins to access enclosing environments.)
 
+# Creates a summary object containing information about a tree.
+# The summary is memoized.
+getSummary = (tree, doSubtrees = false) ->
+	#if doSubtrees
+	#	for sub in tree.subtrees
+	#		createSummary(sub, doSubtrees)
+
+	if tree.summary then return tree.summary
+
+	summary =
+		tree: tree
+		ownerContext: tree.context.outerContext
+		typeMembers: (which) -> typeMembers(tree, which)
+		termMembers: (which) -> termMembers(tree, which)
+		assignedTypes: () -> null #todo
+		assignedTerms: () -> null #todo
+
+	tree.summary = summary
+	summary
+
+# get the type members of the upper bound of the given tree's type.
+# result is an object mapping IDs to summary objects.
+typeMembers = (tree, which) ->
+	members = {}
+	switch tree.type
+		when "STATEMENTS"
+			for st in tree.statements
+				if st.type is "TYPE-DECL"
+					ID = st.lhs.match
+					typTree = if which is "UPPER" then st.rhsUpper else st.rhsLower
+					# TODO: if type member already exists, restrict its bounds
+					members[ID] = getSummary(typTree)
+				# TODO: term decls, inference from assignments
+
+		when "TYPE-SELECT"
+			m = getSummary(tree.prefix).typeMembers("LOWER")
+			if not m[tree.ID]
+				throw "Error : '#{tree.ID}' is not a member of ${tree.prefix} on line #{tree.line} character #{tree.column}"
+		when "TERM-SELECT"
+			m = getSummary(tree.prefix).termMembers("LOWER")
+			if not m[tree.id]
+				throw "Error : '#{tree.id}' is not a member of ${tree.prefix} on line #{tree.line} character #{tree.column}"
+			typeMembers(m[tree.id], which)
+
+		#when "AND-TYPE"
+		when "id"
+			members = tree.context.lookupSymbol(tree.lhs.match, tree.line, tree.column).summary.typeMembers(which)
+		when "ID"
+			members = tree.context.lookupSymbol(tree.lhs.match, tree.line, tree.column).summary.typeMembers(which)
+	members
+
+###
 findMembers = (tree) ->
+	if tree.membership then return tree.membership
+
+	membership = {}
 
 	if tree.type is "STATEMENTS"
 
@@ -322,42 +394,20 @@ findMembers = (tree) ->
 					lowerTree: st.rhs
 					upperTree: st.rhs
 
+		membership.typeDecls = typeDecls
+		membership.termDecls = termDecls
+
 	if tree.type is "AND-TYPE"
+		lhsTyp = findMembers(tree.lhs)
+		rhsTyp = findMembers(tree.rhs)
+		typeDecls = {}
+		for ID, typ of lhsTyp.typeDecls
+			typeDecls
 
+	tree.membership = membership
+	membership
+###
 
-
-assignType = (tree) ->
-	if not tree.typ
-		tree.typ
-	else
-		tree.typ =
-
-			# type-decl, term-decl, term-select, type-select, statements
-
-			if tree.type is "TYPE-DECL"
-				lower: () -> assignType(rhsLower).lower()
-				upper: () -> assignType(rhsUpper).upper()
-
-			else if tree.type is "TERM-DECL"
-				lower: () -> assignType(rhs).lower()
-				upper: () -> assignType(rhs).upper()
-
-			else if tree.type is "TERM-SELECT"
-				prefixTyp = assignType(tree.prefix)
-				# Do we need to do any substitutions here? A: No, ...
-				memberSym = prefixTyp.lower().findMember(tree.id)
-
-			else if tree.type is "TYPE-SELECT"
-				prefixTyp = assignType(tree.prefix)
-				# Do we need to do any substitutions here? A: No, ...
-				memberSym = prefixTyp.lower().findMember(tree.ID)
-
-			else if tree.type is "STATEMENTS"
-
-
-			#TODO: named base-type approximations?
-
-		tree.typ
 
 AddSymbolFromNamedType = (context, name, typ) ->
 	sym =
@@ -365,7 +415,7 @@ AddSymbolFromNamedType = (context, name, typ) ->
 		typ: typ
 	context.symbols[name] = sym
 
-	sym.info = () -> sym.typ
+	sym.summary = () -> sym.typ
 
 	sym
 
@@ -377,7 +427,7 @@ AddSymbolFromTree = (context, name, defTree, line, column) ->
 		column: column
 	context.symbols[name] = sym
 
-	sym.info = () -> assignType(sym.defTree)
+	sym.summary = () -> getSummary(sym.rhs)
 
 	sym
 
@@ -402,7 +452,7 @@ contextify = (outerContext, tree) ->
 					throw "Duplicate definition of #{symName}: line #{prevDef.line} and line #{t.line}"
 				AddSymbolFromTree(tree.context, symName, t.rhs, t.line, t.column)
 
-				output.push "(line #{t.line} character #{t.column}) #{symName} : #{typTree.stringify(0)}"
+				output.push "(line #{t.line} character #{t.column}) #{symName} : #{t.rhs.stringify(0)}"
 
 			#TODO: type inference for term assignments that don't have matching term declarations?
 			#  perhaps associate each term symbol with a list of terms, then compute a synthethic union type upon request?
@@ -497,12 +547,13 @@ parse = (tokens) ->
 			stack.push t
 			return true
 
-		if matches(["ID", "COLON", "*", "ATLEAST", "*", "NEWLINE"])
+		if matches(["ID", "COLON", "ATMOST", "*", "ATLEAST", "*", "NEWLINE"])
 			stack.pop()
 			if matches(["TYPE", "ATLEAST", "TYPE"])
 				rhsLower = stack.pop()
 				stack.pop()
 				rhsUpper = stack.pop()
+				stack.pop()
 				stack.pop()
 				lhs = stack.pop()
 				t =
@@ -513,17 +564,20 @@ parse = (tokens) ->
 					rhsLower: rhsLower
 					line: lhs.line
 					column: lhs.column
-				t.stringify = (indent) -> t.lhs.stringify(indent) + ": " + t.rhsUpper.stringify(indent) + strtyp(t,indent)
-				t.subtrees = () -> [t.lhs, t.rhs]
+				t.stringify = (indent) -> t.lhs.stringify(indent) +
+					": at most " + t.rhsUpper.stringify(indent) +
+					" at least " + t.rhsLower.stringify(indent) + strtyp(t,indent)
+				t.subtrees = () -> [t.lhs, t.rhsUpper, t.rhsLower]
 				stack.push t
 				return true
 			else
-				expected("TYPE in bounds declaration of #{fromTopOfStack(4).stringify(0)}")
+				expected("TYPE in bounds declaration of #{fromTopOfStack(5).stringify(0)}")
 
-		if matches(["ID", "COLON", "*", "NEWLINE"])
+		if matches(["ID", "COLON", "ATMOST", "*", "NEWLINE"])
 			stack.pop()
 			if matches(["TYPE"])
 				rhsUpper = stack.pop()
+				stack.pop()
 				stack.pop()
 				lhs = stack.pop()
 				t =
@@ -534,12 +588,14 @@ parse = (tokens) ->
 					rhsLower: Token("ID", "Nothing", rhsUpper.line, rhsUpper.column)  # synthetic lower bound
 					line: lhs.line
 					column: lhs.column
-				t.stringify = (indent) -> t.lhs.stringify(indent) + ": " + t.rhsUpper.stringify(indent) + strtyp(t,indent)
-				t.subtrees = () -> [t.lhs, t.rhs]
+				t.stringify = (indent) -> t.lhs.stringify(indent) +
+					": at most " + t.rhsUpper.stringify(indent) +
+					" at least " + t.rhsLower.stringify(indent) + strtyp(t,indent)
+				t.subtrees = () -> [t.lhs, t.rhsUpper, t.rhsLower]
 				stack.push t
 				return true
 			else
-				expected("TYPE in declaration of #{fromTopOfStack(2).stringify(0)}")
+				expected("TYPE in declaration of #{fromTopOfStack(3).stringify(0)}")
 
 		if matches(["id", "COLON", "*", "NEWLINE"])
 			stack.pop()
@@ -706,7 +762,7 @@ parse = (tokens) ->
 		stack_contents = (for t in stack
 			i += 1
 			"Item #{i}: #{showTypes(t)}\n#{t.stringify(0)}").join("\n\n")
-		throw "Parse error: Unreduced items on stack at End-of-Input. Stack contents: #{stack_contents}"
+		throw "Parse error: Unreduced items on stack at End-of-Input. Stack contents:\n\n#{stack_contents}"
 
 	return stack[0]
 
@@ -720,6 +776,7 @@ tokenize = (input) ->
 		{ name: "SPECIALIZES", regex: /^specializes/ }
 		{ name: "SPECIALIZED_BY", regex: /^specialized\s+by/ }
 		{ name: "ATLEAST", regex: /^at\s+least/ }
+		{ name: "ATMOST", regex: /^at\s+most/ }
 		{ name: "GUARD_ARROW", regex: /^=>/ }
 
 		{ name: "id", regex: /^[a-z][a-zA-z0-9_]*/ }
@@ -752,10 +809,7 @@ tokenize = (input) ->
 		for tok in tokenList
 			matches = tok.regex.exec(input)
 			if matches
-				tk = Token(tok.name, matches[0], line, column)
-				tk.stringify = () -> tk.match.replace('\n', '\\n')
-				tk.print = () -> "#{tk.type}, \"#{tk.match.replace('\n', '\\n')}\", line #{tk.line}, char #{tk.column}"
-				return tk
+				return Token(tok.name, matches[0], line, column)
 
 		length = input.indexOf('\n')
 		if length <= 0 then length = input.length
@@ -775,14 +829,10 @@ tokenize = (input) ->
 	loop
 		t = consumeNextToken()
 		if t.type == "RBRACE" or t.type == "EOF"  # add a synthetic newline before "}" or EOF for parsing convenience
-			tokens.push
-				type: "NEWLINE"
-				match: "\n"
-				line: t.line
-				column: t.column
-				isToken: true
-				stringify: () -> "(synthetic \\n)"
-				print: () -> "synthetic NEWLINE on line #{t.line}, char #{t.column}"
+			tk = Token("NEWLINE", "\n", t.line, t.column)
+			tk.stringify = () -> "(synthetic \\n)"
+			tk.print = () -> "synthetic NEWLINE on line #{t.line}, char #{t.column}"
+			tokens.push tk
 		tokens.push t
 		if t.type == "EOF" then break
 
