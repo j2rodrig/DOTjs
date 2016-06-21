@@ -12,16 +12,11 @@ window.compile = (input, stopAfter) ->
 			return ast.print(0)
 
 		registerSymbols(ast, createGlobalContext())
-		registerBaseTypes(ast)  # for convenience, we want to precompute lower and upper base type sequences.
 
 		if stopAfter == "symbols"
 			printSymbolTables(ast)
 
-		# We want to be able to create an instance of this program,
-		# so we treat the entire AST as a constructor definition.
-		registerDeclarationsForConstruction(ast, ast.ctx)
-
-		output = construct(ast)
+		output = genConstructor(ast, ast.ctx, 0)   # treat the entire program as a single constructor
 
 		output
 
@@ -311,13 +306,67 @@ findMember that searches through type trees.
 *There is a canonical form for any type tree: (S1 & ... & SN) | ... | (T1 & ... & TM) where every Sn and Tm is a
 statement block.
 
+June 21.
+
+	How do we generate mixin constructors?
+
+	Say we have:
+		T : { a } & { b }
+	When we go to construct an instance of T:
+		T.new
+	we need to have a mixin constructor for T that builds an object with a type compatiable with T.
+	Compatibility with T means that the constructed object's type must be compatible with T's lower bound.
+
+	As for the statments that go into T's mixin constructor, we can select any statements we want.
+	However, we should at least make an effort to ensure that all fields declared in T's lower bound get initialized
+	and initialized in a reasonable order, even if the lower bound of T contains union types.
+	The solution here is to traverse the lower-bound type of T all the way down to concrete statements,
+	and generate all term-like statements in the order that they appear.
+	For consistency, we may say that Nothing contains no statements (although it contains all possible
+	declarations). By saying that Nothing contains no statements, the lower bound of an intersection type
+	A & B -- although quite possibly containing a union with Nothing -- will still be constructible and
+	generate all expected statements. There is still an issue with implementation inheritance, however:
+	after narrowing a type member's bounds, one would expect that the statements in a newly-declared
+	lower bound would supercede -- not append to -- statements in the previously-declared lower bound.
+
+	The issue of implementation inheritance would benefit from some more thought...
+
+	For now, it suffices to say that side-effect-free constructors called in linearization order should
+	produce a reasonable result; term-member initializations override any prior conflicting initializations
+	at runtime, and indeed unneeded prior initializations are potentially elidable through optimization.
+
+	Perhaps the best thing to do here is try some examples after codegen is completed.
+
+
+	Another issue is what to do about out-of-order statements. For now, nothing. Ideally, statements
+would be reordered based on depenency. But this doesn't have to happen yet.
+
 ###
 
+Any =
+	type: "ANY"
+	alttypes: undefined
+	line: "(built-in)"
+	column: "(built-in)"
+
+Nothing =
+    type: "NOTHING"
+    alttypes: undefined
+	line: "(built-in)"
+	column: "(built-in)"
+
+TypeBounds = (typLower, typUpper) ->
+	type: "TYPE-BOUNDS"
+	alttypes: undefined
+	lower: typLower
+	upper: typUpper
+
+### CONTEXTS AND SYMBOLS ###
 
 createGlobalContext = () ->
 	ctx = freshContext()
-	ctx.addSymbolFromType("Any", Any)
-	ctx.addSymbolFromType("Nothing", Nothing)
+	ctx.addSymbol("Any", Any)
+	ctx.addSymbol("Nothing", Nothing)
 	ctx
 
 freshContext = (outer) ->
@@ -338,190 +387,25 @@ freshContext = (outer) ->
 
 	ctx.fresh = () -> freshContext(outer)
 
-	# The rule for membership is simpler than Scala:
-	# Two symbols denote the same member if they are registered in the same context with the same name.
-
-	ctx.addSymbolFromType = (name, typ, meta, line, column) ->
-		if ctx.members[name]
-			throw "Error : Duplicate definition of '#{name}' at line #{line} character #{column}"
-		record =
-			name: name
-			ctx: ctx  # convenience: remember which context registered the symbol (we need this for codegen)
-			typ: typ
-			meta: meta
-		ctx.members[name] = record
-
-	ctx.addSymbolFromTree = (name, defTree, meta) ->
+	ctx.addSymbol = (name, typTree, meta) ->
 		if ctx.members[name]
 			throw "Error : Duplicate definition of '#{name}' at line #{defTree.line} character #{defTree.column}"
 		record = if ctx.members[name] then ctx.members[name] else
 			name: name
 			ctx: ctx  # convenience: remember which context registered the symbol (we need this for codegen)
-			defTree: defTree
+			typTree: typTree
 			meta: meta
 		ctx.members[name] = record
 
-	###
-	ctx.findMember = (name, tree) ->
-		if ctx.members[name] then return ctx.members[name]
-		if ctx.isCtor
-			findMemberInBaseTypes(name, tree)
-		if ctx.outer then return outer.findMember(name)
-		undefined
-
-	ctx.requireMember = (name, line, column) ->
-		record = ctx.findMember(name)
-		if not record then throw "Member not found error : Could not find '#{name}' on line #{line} character #{column}"
-		record
-	###
-
 	ctx
 
-
-# The top type Any. Any is the most general type.
-# In fact, Any is so general that every object in existence is an instance of it.
-# Hence, the name "Any".
-Any =
-    typtyp: "AND-TYPE"
-    components: []
-
-# The bottom type Nothing. Nothing is the most specific type.
-# In fact, Nothing is so specific that we can't create an instance of it.
-# Hence, the name "Nothing".
-Nothing =
-    typtyp: "NOTHING"
-
-TypeBounds = (lower, upper) ->
-	typtyp: "TYPE-BOUNDS"
-	lower: lower
-	upper: upper
-
-### CODEGEN ###
-
-construct = (typTree, outerCtx) ->
-
-	ctx = outerCtx.fresh()
-
-	#todo linearize members, enter into symbol table
-	# 1. find & narrow type declarations
-	# 2. use type assignments to further narrow type declarations
-	# 3. find term declarations
-	# 4. use term assignments to infer types of undeclared terms
-
-	linearizeStatements(typTree)
-	findTypeDecls(typTree)
-
-	# Generate constructor body
-	constructorElements(typTree, ctx)
-
-constructorElements = (typTree, ctx) ->
-	linearBases = []
-
-	doBases = (tree) ->
-		if tree.type in ["ID", "TYPE-SELECT", "STATEMENTS"]
-			linearBases.push tree
-		else if tree.type in ["AND-TYPE", "OR-TYPE"]
-			# Here, OR types are treated like AND types.
-			# Basically, we do this in order to always get a constructible object.
-			doBases(tree.lhs)
-			doBases(tree.rhs)
-
-	doBases(typTree)
-
-	#
-
-
-### MEMBERSHIP ###
-
-# Finds the named symbol in the given context.
-# Searches enclosing contexts if the name is not found in the given context.
-findMemberInContext = (name, ctx) ->  #TODO: optional filtering of public/private names?
-	if not ctx
-		console.log("findMemberInContext '#{name}' : Not Found")
-		return undefined
-
-	if ctx.isConstructor
-		console.log("findMemberInContext '#{name}' in constructor context '#{ctx.name}'")
-		typTree = findMemberInTypeTree(name, ctx.tree)
-		if typTree
-			return typTree
-
-	else if ctx.members[name]
-		console.log("findMemberInContext '#{name}' in context '#{ctx.name}' : Found")
-		return ctx.members[name].defTree  #todo: return defTree, member record, or something else? What's needed by the caller?
-
-	findMemberInContext(name, ctx.outer)
-
-# Finds the named member in the type defined by the given tree.
-findMemberInTypeTree = (name, tree) ->
-
-	if tree.type is "STATEMENTS"
-		return tree.ctx.members[name]
-
-	else if tree.type is "TYPE-SELECT"
-		findMemberInTypeTree(name, widen(tree))
-
-	else if tree.type is "ID"
-		findMemberInTypeTree(name, widen(tree))
-
-	else if tree.type is "AND-TYPE"
-		lhs = findMemberInTypeTree(name, tree.lhs)
-		rhs = findMemberInTypeTree(name, tree.rhs)
-
-# Widens selections or identifiers to their declared types.
-widen = (tree) ->
-	if tree.type is "TYPE-SELECT" or tree.type is "TERM-SELECT"
-		prefixTypTree = widen(tree.prefix)
-		findMemberInTypeTree(tree.ID, prefixTypTree)
-
-	else if tree.type is "ID" or tree.type is "id"
-		findMemberInContext(tree.lhs.match, tree.ctx)
-
-
-
-# ???
-constrMembers = (tree, alreadySeen = []) ->
-
-	# Membership is memoized.
-	if tree.constrMembers then return tree.constrMembers
-
-	if tree in alreadySeen
-		throw "Recursive definition found while finding constructible members. Trees seen:\n" +
-			(for t in alreadySeen
-				"Line #{t.line}: " + t.stringify(0) + "\n\n") +
-			tree.stringify(0)
-
-	members =
-		if tree.type is "STATEMENTS"
-			members = {}
-			for st in tree.statements
-				if st.type is "TYPE-DECL" or st.type is "TERM-DECL"
-					name = st.lhs.match
-					if members[name] then throw "'#{name}' is declared more than once in the same statement block on line #{st.line} character #{st.column}"
-					members[name] = st
-
-		else if tree.type is "AND-TYPE" or tree.type is "OR-TYPE"
-
-		else if tree.type is "TYPE-SELECT"
-			prefixMem = constrMembers(tree.prefix)
-			if not prefixMem[tree.ID]
-				throw "Error : '#{ID}' is not a member of #{tree.prefix.stringify(0)}"
-			record = prefixMem[tree.ID]
-			if record.typTree
-				constrMembers(record.typTree)
-			else
-				throw "Internal compiler error : Name "
-
-		else if tree.type is "ID" or tree.type is "id"
-			record = tree.ctx.requireMember(tree.match)
-			if record.typTree
-				constrMembers(record.typTree)
-
-	tree.constrMembers = members
-	members
-
-
-### CONTEXTS AND SYMBOLS ###
+enclosingConstructorContext = (ctx) ->
+	if ctx.isConstructor or ctx.isMixinConstructor
+		ctx
+	else if ctx.outer
+		enclosingConstructorContext(ctx.outer)
+	else
+		ctx
 
 registerSymbols = (tree, ctx) ->
 
@@ -530,137 +414,358 @@ registerSymbols = (tree, ctx) ->
 		ctx.isConstructor = true
 
 	else if tree.type is "STATEMENTS"
-		ctx = ctx.fresh()
+		ctx = ctx.fresh()  # generate a fresh context to hold declarations contained in the statement block
 
-	else
-		if tree.type is "TYPE-DECL" or tree.type is "TERM-DECL"
-			ctx.addSymbolFromTree(tree.lhs.match, tree)
+	else if tree.type is "TERM-DECL"
+		ctx.addSymbol(tree.lhs.match, tree.rhs)
+
+	else if tree.type is "TYPE-DECL"
+		ctx.addSymbol(tree.lhs.match, TypeBounds(tree.rhsLower, tree.rhsUpper))
+		ctx = ctx.fresh()  # generate a fresh context for the type's mixin constructor
+		ctx.isMixinConstructor = true
+
+	tree.ctx = ctx
+	ctx.tree = tree
 
 	if tree.subtrees
 		for subtree in tree.subtrees
 			registerSymbols(subtree, ctx)
 
-	tree.ctx = ctx
-	ctx.tree = tree
+### TYPE OPERATIONS ###
 
+derivedTypeBounds = (tree, lower, upper) ->
+	if lower is tree.lower and upper is tree.upper
+		tree
+	else
+		TypeBounds(lower, upper)
 
+derivedAndOrType = (tree, lhs, rhs) ->
+	if lhs is tree.lhs and rhs is tree.rhs
+		tree
+	else if tree.type is "AND-TYPE"
+		AndType(lhs, rhs)
+	else if tree.type is "OR-TYPE"
+		OrType(lhs, rhs)
 
-	#if tree.type is "CONSTRUCT"
-	#	registerDeclarationsForConstruction(tree.typTree, tree.ctx)
+lowerBound = (tree) ->
+	if tree.type is "TYPE-BOUNDS"
+		tree.lower
+	else
+		tree
 
+upperBound = (tree) ->
+	if tree.type is "TYPE-BOUNDS"
+		tree.upper
+	else
+		tree
 
+simplifyType = (tree) ->
 
-
-
-
-
-registerLinearization = (tree, ctorCtx) ->
-
-	if tree.type is "STATEMENTS"
-		ctorCtx.addConcreteBase(tree)
+	if tree.type is "TYPE-BOUNDS"
+		tree2 = derivedTypeBounds(tree, simplifyType(tree.lower), simplifyType(tree.upper))
+		if tree2.lower is tree2.upper   # if bounds are equivalent, then just return one of them
+			tree2.lower
+		else
+			tree2
 
 	else if tree.type is "AND-TYPE"
-		registerLinearization(tree.lhs, ctorCtx)
-		registerLinearization(tree.rhs, ctorCtx)
+		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
+		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
+			tree2.lhs
+		else if tree2.lhs is Nothing or tree2.rhs is Nothing   # intersection with Nothing === Nothing
+			Nothing
+		else if tree2.lhs is Any   # intersection with Any is redundant
+			tree2.rhs
+		else if tree2.rhs is Any
+			tree2.lhs
+		else
+			tree2
 
 	else if tree.type is "OR-TYPE"
-		registerLinearization(tree.lhs, ctorCtx)
-		registerLinearization(tree.rhs, ctorCtx)
-
-	else if tree.type is "ID"
-		record = tree.ctx.findMember(tree.match)   # should return a list of denotations, which are definition trees
-		# todo look through returned denotation trees, and call registerLinearization again
-		#ctorCtx.addConcreteBase(tree)
-
-	else if tree.type is "TYPE-SELECT"
-		ctorCtx.addConcreteBase(tree)
-
-
-# Register base types.
-# Makes a record of the base type trees needed to build each object in the appropriate constructor context.
-# All base type trees are statement blocks, type IDs, or type selections.
-registerBaseTypes = (tree, ctorCtx) ->
-
-	if tree.type is "CONSTRUCT"
-		registerBaseTypes(tree.typTree, tree.ctx)  # change the constructor context for subtrees
-
-	else if ctorCtx
-		if tree.type is "STATEMENTS"
-			ctorCtx.addConcreteBase(tree)
-			for st in tree.statements
-				registerBaseTypes(st, null)  # look for more constructors
-
-		else if tree.type is "AND-TYPE"
-			registerBaseTypes(tree.lhs, ctorCtx)
-			registerBaseTypes(tree.rhs, ctorCtx)
-
-		else if tree.type is "OR-TYPE"
-			registerBaseTypes(tree.lhs, ctorCtx)
-			registerBaseTypes(tree.rhs, ctorCtx)
-
-		else if tree.type is "ID"
-			ctorCtx.addConcreteBase(tree)
-
-		else if tree.type is "TYPE-SELECT"
-			ctorCtx.addConcreteBase(tree)
-			for st in tree.subtrees
-				registerBaseTypes(st, null)  # look for more constructors
-
+		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
+		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
+			tree2.lhs
+		else if tree2.lhs is Any or tree2.rhs is Any   # union with Any === Any
+			Any
+		else if tree2.lhs is Nothing   # union with Nothing is redundant
+			tree2.rhs
+		else if tree2.rhs is Nothing
+			tree2.lhs
 		else
-			throw "Internal compiler error : Unexpected '#{tree.type}' tree in registerBaseTypes"
-
-	else if tree.subtrees
-		# look for constructors in subtrees
-		for st in tree.subtrees
-			registerBaseTypes(st, null)
-
-
-registerDeclarationsForConstruction = (tree, intoCtx) ->
-	# Membership in the self-type is determined lazily.
-	# We're not going to register declarations directly.
-	# Instead, we're going to set up a lazy evaluation of membership sets.
-	# SO: what I'm going to do now is defer the construction of this method until lazy membership is defined.
-
-	if tree.type is "ID"
-		# TODO: find the ID in the self-type.
-
-
-
-		# Linearize members of the type ID into the construction context
-		record = tree.ctx.requireMember(tree.match, tree.line, tree.column)
-		for mem in constrMembersOf(record)
-			registerIfDeclaration(mem, intoCtx)
-
-	else if tree.type is "AND-TYPE" or tree.type is "OR-TYPE"
-
-	else if tree.type is "TYPE-SELECT"
-
-	else if tree.type is "STATEMENTS"
-		if tree.ctx is not intoCtx     # don't re-register symbols into the construction context if it is the same as the statment-block context
-			for st in tree.statements
-				registerIfDeclaration(st, intoCtx)
+			tree2
 
 	else
-		throw "Internal error : Unexpected '#{tree.type}' tree in registerDeclarationsForConstruction"
+		tree
 
-# Finds the declared membership of the lower bound of the given symbol record (that is, the union of membership sets).
-constrMembersOf = (symRecord) ->
-	mems = []
-	for denot in symRecord.denotations
-		if denot.defTree
-			denot.defTree
-			mems.push #TODO: what we've really got to do instead here is to do lazy evaluation of type membership...
+
+### MEMBERSHIP ###
+
+# Finds named members of the given type tree in linearization order.
+# Returns Nothing if the set of named members is non-finite.
+findNamedMembers = (tree, typesOnly) ->  #TODO: filtering of public/private names?
+
+	if tree.type is "STATEMENTS"
+		members = []
+		for st in tree.statements
+			if st.type is "TYPE-DECL"
+				members.push st.lhs.match
+			else if tree.type is "TERM-DECL" and not typesOnly
+				members.push st.lhs.match
+		members
+
+	else if tree.type is "ANY"
+		[]
+
+	else if tree.type is "NOTHING"
+		Nothing
+
+	else if tree.type is "TYPE-SELECT"
+		wt = widen(tree)
+		if not wt
+			throw "Error: Cannot find definition of '#{tree.ID}' on line #{tree.line} character #{tree.column}"
+		findNamedMembers(wt, typesOnly)
+
+	else if tree.type is "ID"
+		wt = widen(tree)
+		if not wt
+			throw "Error: Cannot find definition of '#{tree.match}' on line #{tree.line} character #{tree.column}"
+		findNamedMembers(wt, typesOnly)
+
+	else if tree.type is "TYPE-BOUNDS"
+		findNamedMembers(tree.lower, typesOnly)
+
+	else if tree.type is "CONSTRUCT"
+		findNamedMembers(tree.typTree, typesOnly)
+
+	else if tree.type is "AND-TYPE"
+		lhs = findNamedMembers(tree.lhs, typesOnly)
+		rhs = findNamedMembers(tree.rhs, typesOnly)
+		if lhs is Nothing or rhs is Nothing
+			Nothing
 		else
-			throw "Internal error : Unexpected non-tree member definition in denotation set of symbol #{symRecord.name}"
-	mems
+			for name in rhs
+				if not (name in lhs)
+					lhs.push name
+			lhs
 
-registerIfDeclaration = (tree, ctx) ->
-	if tree.type is "TYPE-DECL" or tree.type is "TERM-DECL"
-		ctx.addSymbolFromTree(tree.lhs.match, tree)
+	else if tree.type is "OR-TYPE"
+		lhs = findNamedMembers(tree.lhs, typesOnly)
+		rhs = findNamedMembers(tree.rhs, typesOnly)
+		if lhs is Nothing
+			rhs
+		else if rhs is Nothing
+			lhs
+		else
+			both = []
+			for name in lhs
+				if name in rhs
+					both.push name
+			both
+
+	else
+		throw "Internal compiler error : Expected a type tree in findNamedMembers, got '#{tree.type}' tree"
 
 
+# Finds the named symbol in the given context.
+# Returns a type tree describing the symbol. If the symbol is not found, returns undefined.
+# Searches enclosing contexts if the name is not found in the given context.
+findMemberInContext = (name, ctx) ->  #TODO: optional filtering of public/private names?
+	if not ctx
+		console.log("findMemberInContext: '#{name}' Not Found")
+		return undefined
+
+	typTree =
+		if ctx.isConstructor or ctx.isMixinConstructor
+			console.log("findMemberInContext '#{name}' in constructor context '#{ctx.name}'")
+			findMemberInTypeTree(name, ctx.tree)
+
+		else if ctx.members[name]
+			console.log("findMemberInContext '#{name}' in context '#{ctx.name}' : Found")
+			ctx.members[name].typTree
+
+	if typTree
+		typTree
+	else
+		findMemberInContext(name, ctx.outer)
+
+# Finds the named member in the type defined by the given tree.
+# Returns undefined if the name is not a member of the given type tree.
+findMemberInTypeTree = (name, tree, useLowerBound) ->
+
+	if not tree
+		throw "Error: Request for member '#{name}' from an undefined type"
+
+	if tree.type is "STATEMENTS"
+		tree.ctx.members[name]
+
+	else if tree.type is "ANY"
+		undefined   # same as requesting a member of an empty statement block
+
+	else if tree.type is "NOTHING"
+		TypeBounds(Nothing, Any)   # the name is defined (because Nothing defines all names), but we don't know anything about it. So assign maximal bounds.
+
+	else if tree.type is "TYPE-SELECT"
+		wt = widen(tree)
+		if not wt
+			throw "Error: Cannot find definition of '#{tree.ID}' on line #{tree.line} character #{tree.column}"
+		findMemberInTypeTree(name, wt, useLowerBound)
+
+	else if tree.type is "ID"
+		wt = widen(tree)
+		if not wt
+			throw "Error: Cannot find definition of '#{tree.match}' on line #{tree.line} character #{tree.column}"
+		findMemberInTypeTree(name, wt, useLowerBound)
+
+	else if tree.type is "TYPE-BOUNDS"
+		if useLowerBound
+			findMemberInTypeTree(name, tree.lower, useLowerBound)
+		else
+			findMemberInTypeTree(name, tree.upper, useLowerBound)
+
+	else if tree.type is "AND-TYPE"
+		lhs = findMemberInTypeTree(name, tree.lhs, useLowerBound)
+		rhs = findMemberInTypeTree(name, tree.rhs, useLowerBound)
+		if lhs and rhs
+			simplifyType(
+				TypeBounds(
+					OrType(lowerBound(lhs), lowerBound(rhs)),
+					AndType(upperBound(lhs), upperBound(rhs))
+					))   # both sides of the AND-TYPE define this name, so do an intersection of declarations
+		else if lhs
+			lhs     # if the right-hand-side is not defined, return left-hand-side
+		else if rhs
+			rhs     # if the left-hand-side is not defined, return right-hand-side
+		else
+			undefined  # the name is not defined on either side
+
+	else if tree.type is "OR-TYPE"
+		lhs = findMemberInTypeTree(name, tree.lhs, useLowerBound)
+		rhs = findMemberInTypeTree(name, tree.rhs, useLowerBound)
+		if lhs and rhs
+			simplifyType(
+				TypeBounds(
+					AndType(lowerBound(lhs), lowerBound(rhs)),
+					OrType(upperBound(lhs), upperBound(rhs))
+					))   # both sides of the OR-TYPE define this name, so do a union of declarations
+		else
+			undefined   # if either side does not define the name, then the union does not define it
+
+	else
+		throw "Internal compiler error : Expected a type tree in findMemberInTypeTree, got '#{tree.type}' tree"
+
+# Widens selections or identifiers to their declared types.
+widen = (tree) ->
+	if tree.type is "TYPE-SELECT"
+		prefixTypTree = widen(tree.prefix)
+		if not prefixTypTree
+			throw "Error: Cannot find definition of '#{tree.ID}' on line #{tree.line} character #{tree.column}"
+		findMemberInTypeTree(tree.ID, prefixTypTree)
+
+	else if tree.type is "TERM-SELECT"
+		prefixTypTree = widen(tree.prefix)
+		if not prefixTypTree
+			throw "Error: Cannot find definition of '#{tree.id}' on line #{tree.line} character #{tree.column}"
+		findMemberInTypeTree(tree.id, prefixTypTree)
+
+	else if tree.type is "ID" or tree.type is "id"
+		findMemberInContext(tree.match, tree.ctx)
+
+	else
+		throw "Internal compiler error : Attempt to widen a non-named-type tree '#{tree.type}' on line #{tree.line} character #{tree.column}"
 
 
+### CODEGEN ###
+
+genConstructor = (typTree, ctorCtx, indent) ->
+
+	"(" + genMixinConstructor(typTree, ctorCtx, indent) + ")({})"
+
+genMixinConstructor = (typTree, ctorCtx, indent) ->
+
+	preamble = "function(#{ctorCtx.name}){\n"
+	statements = genStatementsFromTypeTree(typTree, ctorCtx, indent + 1)
+	postfix = tabs(indent) + "}"
+
+	preamble + statements + postfix
+
+genStatementsFromTypeTree = (tree, ctorCtx, indent) ->
+
+	if tree.type is "STATEMENTS"
+		#ctx = if tree.ctx.outer is ctorCtx then ctorCtx else tree.ctx  # find out if we should use the current or constructor context
+		(for st in tree.statements
+			genStatementsFromTypeTree(st, ctorCtx, indent + 1)).join('')
+
+	else if tree.type is "TYPE-DECL"
+		assignto = "#{ctorCtx.name}.#{tree.lhs.match} = "
+		ctor = genMixinConstructor(tree.rhsLower, tree.rhsLower.ctx, indent)
+
+		tabs(indent) + assignto + ctor
+
+	else if tree.type is "TYPE-SELECT"
+		[prefixJs, prefixTypTree] = genTerm(tree.prefix, ctorCtx, indent + 1)
+		typTree = findMemberInTypeTree(tree.ID, prefixTypTree)
+		if typTree
+			tabs(indent) + "#{prefixJs}.#{tree.ID}(ctorCtx.name);\n"
+		else
+			throw "Error : Cannot find definition of '#{tree.id}' on line #{tree.line} character #{tree.column}"
+
+	else if tree.type is "ID"
+		typTree = findMemberInContext(tree.ID, ctorCtx)
+		if typTree
+			tabs(indent) + "#{enclosingConstructorContext(typTree.ctx).name}.#{tree.ID}();\n"
+		else
+			throw "Error : Cannot find definition of '#{tree.ID}' on line #{tree.line} character #{tree.column}"
+
+	else if tree.type is "TERM-ASSIGN"
+		[jsLhs, typLhs] = genTerm(tree.lhs, ctorCtx, indent)
+		[jsRhs, typRhs] = genTerm(tree.rhs, ctorCtx, indent)
+
+		# TODO: check that typRhs <: typLhs
+
+		tabs(indent) + jsLhs + " = " + jsRhs + ";\n"
+
+	else if tree.type in ["id", "TERM-SELECT", "CONSTRUCT"]   # a term used as a statement
+		[js, typTree] = genTerm(tree, ctorCtx, indent)
+		tabs(indent) + js + ";\n"
+
+	else
+		throw "Internal compiler error: Unimplemented tree type '#{tree.type}' in genStatementsFromTypeTree"
+
+
+	#else if tree.type is "TYPE-BOUNDS"
+	#	genStatementsFromTypeTree
+
+	#else if tree.type is "ANY"   # Any contains no statements
+	#	""
+
+	#else if tree is "NOTHING"  # Nothing cannot be constructed
+	#	tabs(indent) + 'throw "Error : Attempt to instantiate \'Nothing\', an unconstructible type";\n'
+
+genTerm = (tree, ctx, indent) ->
+
+	if tree.type is "id"
+		typTree = findMemberInContext(tree.match, tree.ctx)
+		if typTree
+			["#{enclosingConstructorContext(typTree.ctx).name}.#{tree.match}", typTree]
+		else
+			throw "Error : Cannot find definition of '#{tree.match}' on line #{tree.line} character #{tree.column}"
+
+	else if tree.type is "TERM-SELECT"
+		[prefixJs, prefixTypTree] = genTerm(tree, ctx, indent)
+		typTree = findMemberInTypeTree(tree.id, prefixTypTree)
+		if typTree
+			["#{prefixJs}.#{tree.id}", typTree]
+		else
+			throw "Error : Cannot find definition of '#{tree.id}' on line #{tree.line} character #{tree.column}"
+
+	else if tree.type is "CONSTRUCT"
+		[genConstructor(tree.typTree, tree.ctx, indent), tree.typTree]
+
+	else if tree.type is "NOT-IMPLEMENTED"
+		['(function(){throw "Not Implemented"})()', Nothing]
+
+	else
+		throw "Error : In genTerm, expected TERM tree, got #{tree.type} tree on line #{tree.line} character #{tree.column}"
 
 
 ### PARSER ###
@@ -752,6 +857,14 @@ parse = (tokens) ->
 				fromTopOfStack(0).type = "NEW"
 				fromTopOfStack(0).alttypes = undefined
 				return true
+			if fromTopOfStack(0).match is "outer"
+				fromTopOfStack(0).type = "OUTER"
+				fromTopOfStack(0).alttypes = undefined
+				return true
+			if fromTopOfStack(0).match is "???"
+				fromTopOfStack(0).type = "NOT-IMPLEMENTED"
+				fromTopOfStack(0).alttypes = ["TERM"]
+				return true
 
 		if matches(["id", "id"])
 			a = fromTopOfStack(1)
@@ -767,12 +880,6 @@ parse = (tokens) ->
 				a.type = "ATMOST"
 				a.match = a.match + " " + b.match
 				a.alttypes = undefined
-				return true
-
-		if matches(["id"])
-			if fromTopOfStack(0).match is "outer"
-				fromTopOfStack(0).type = "OUTER"
-				fromTopOfStack(0).alttypes = undefined
 				return true
 
 		### Selections ###
@@ -844,8 +951,6 @@ parse = (tokens) ->
 				lhs = stack.pop()
 				stack.push TypeDecl(lhs, rhsLower, rhsUpper)
 				return true
-			else
-				expected("TYPE in bounds declaration of #{fromTopOfStack(5).stringify(0)}")
 
 		if matches(["ID", "COLON", "*", "*", "NEWLINE"])
 			stack.pop()
@@ -865,8 +970,17 @@ parse = (tokens) ->
 				rhsUpper = Token("ID", "Any", rhsLower.line, rhsLower.column)  # synthetic upper
 				stack.push TypeDecl(lhs, rhsLower, rhsUpper)
 				return true
+
+		if matches(["ID", "COLON", "*", "NEWLINE"])    # a type alias
+			stack.pop()
+			if matches(["TYPE"])
+				rhs = stack.pop()
+				stack.pop()
+				lhs = stack.pop()
+				stack.push TypeDecl(lhs, rhs, rhs)
+				return true
 			else
-				expected("TYPE in declaration of #{fromTopOfStack(3).stringify(0)}")
+				expected("TYPE in declaration of #{fromTopOfStack(2).stringify(0)}")
 
 		if matches(["id", "COLON", "*", "NEWLINE"])
 			stack.pop()
