@@ -1,5 +1,7 @@
 window.compile = (input, stopAfter) ->
 	try
+		clearLog()
+
 		tokens = tokenize(input)
 
 		if stopAfter == "tokens"
@@ -11,17 +13,40 @@ window.compile = (input, stopAfter) ->
 		if stopAfter == "trees"
 			return ast.print(0)
 
-		registerSymbols(ast, createGlobalContext())
+		globalCtx = createGlobalContext()
+		programInstantiateCtx = globalCtx.fresh(ast)
+		programInstantiateCtx.isConstructor = true   # treat the entire program as a single constructor
+		registerSymbols(ast, programInstantiateCtx)
 
 		if stopAfter == "symbols"
 			printSymbolTables(ast)
 
-		output = genConstructor(ast, ast.ctx, 0)   # treat the entire program as a single constructor
+		output = genConstructor(ast, enclosingConstructorContext(ast.ctx), 0) + ";"
 
-		output
+		logText = if channels[stderr] then "/** Stderr log:\n\n" + channels[stderr].join("\n") + "\n**/" else ""
+
+		return [output, logText].join("\n\n")
 
 	catch error
-		return if error.stack then error.stack else error
+		message = if error.message? then error.message else error
+		message = if message.toUpperCase().startsWith("ERROR") or message.toUpperCase().startsWith("INTERNAL COMPILER ERROR") then message else "Error: " + message
+		stacktrace = if error.stack? then error.stack else ""
+		logText = if channels[stderr] then "Stderr log:\n\n" + channels[stderr].join("\n") else ""
+		return [message, logText, stacktrace].join("\n\n")
+
+
+channels = {}
+
+stderr = "stderr"
+
+clearLog = () ->
+	channels = {}
+
+log = (ch, msg) ->
+	if not channels[ch]
+		channels[ch] = [msg]
+	else
+		channels[ch].push msg
 
 ###
 
@@ -363,13 +388,13 @@ TypeBounds = (typLower, typUpper) ->
 
 ### CONTEXTS AND SYMBOLS ###
 
-createGlobalContext = () ->
-	ctx = freshContext()
+createGlobalContext = (tree) ->
+	ctx = freshContext(tree)
 	ctx.addSymbol("Any", Any)
 	ctx.addSymbol("Nothing", Nothing)
 	ctx
 
-freshContext = (outer) ->
+freshContext = (outer, tree) ->
 	ctx = {}
 
 	if outer
@@ -383,13 +408,18 @@ freshContext = (outer) ->
 
 	ctx.name = "c#{ctx.nestLevel}"
 
+	if tree?
+		ctx.tree = tree
+		tree.ctx = ctx   # also allow moving from tree to context
+
 	ctx.members = {}
 
-	ctx.fresh = () -> freshContext(outer)
+	ctx.fresh = (tr) -> freshContext(ctx, tr)
 
 	ctx.addSymbol = (name, typTree, meta) ->
 		if ctx.members[name]
-			throw "Error : Duplicate definition of '#{name}' at line #{defTree.line} character #{defTree.column}"
+			throw "Error : Duplicate definition of '#{name}' at line #{typTree.line} character #{typTree.column}"
+		if ctx.tree then log(stderr, "(Symbols) Registering name #{name} in context #{ctx.name}")
 		record = if ctx.members[name] then ctx.members[name] else
 			name: name
 			ctx: ctx  # convenience: remember which context registered the symbol (we need this for codegen)
@@ -407,28 +437,36 @@ enclosingConstructorContext = (ctx) ->
 	else
 		ctx
 
+contextTypeString = (ctx) ->
+	s = []
+	if ctx.isConstructor then s.push "constructor"
+	if ctx.isMixinConstructor then s.push "mixin-constructor"
+	s.push "context"
+	s.join("")
+
 registerSymbols = (tree, ctx) ->
 
+	tree.ctx = ctx   # remember this tree's context. May be rewritten if a new context is created for this tree.
+
 	if tree.type is "CONSTRUCT"
-		ctx = ctx.fresh()
+		ctx = ctx.fresh(tree)
 		ctx.isConstructor = true
 
 	else if tree.type is "STATEMENTS"
-		ctx = ctx.fresh()  # generate a fresh context to hold declarations contained in the statement block
+		ctx = ctx.fresh(tree)  # generate a fresh context to hold declarations contained in the statement block
 
 	else if tree.type is "TERM-DECL"
 		ctx.addSymbol(tree.lhs.match, tree.rhs)
 
 	else if tree.type is "TYPE-DECL"
-		ctx.addSymbol(tree.lhs.match, TypeBounds(tree.rhsLower, tree.rhsUpper))
-		ctx = ctx.fresh()  # generate a fresh context for the type's mixin constructor
+		typTree = TypeBounds(tree.rhsLower, tree.rhsUpper)
+		ctx.addSymbol(tree.lhs.match, typTree)
+
+		ctx = ctx.fresh(typTree)  # generate a fresh context for the type's mixin constructor
 		ctx.isMixinConstructor = true
 
-	tree.ctx = ctx
-	ctx.tree = tree
-
 	if tree.subtrees
-		for subtree in tree.subtrees
+		for subtree in tree.subtrees()
 			registerSymbols(subtree, ctx)
 
 ### TYPE OPERATIONS ###
@@ -567,36 +605,62 @@ findNamedMembers = (tree, typesOnly) ->  #TODO: filtering of public/private name
 
 
 # Finds the named symbol in the given context.
-# Returns a type tree describing the symbol. If the symbol is not found, returns undefined.
+# Returns a record describing the symbol. If the symbol is not found, returns undefined.
 # Searches enclosing contexts if the name is not found in the given context.
-findMemberInContext = (name, ctx) ->  #TODO: optional filtering of public/private names?
+findMemberInContext = (name, ctx, seen) ->  #TODO: optional filtering of public/private names?
 	if not ctx
-		console.log("findMemberInContext: '#{name}' Not Found")
+		log(stderr, "#{name} was not found")
 		return undefined
 
-	typTree =
+	record =
 		if ctx.isConstructor or ctx.isMixinConstructor
-			console.log("findMemberInContext '#{name}' in constructor context '#{ctx.name}'")
-			findMemberInTypeTree(name, ctx.tree)
+			if not ctx.tree
+				throw Error("Internal compiler error: Context #{ctx.name} is not associated with a tree. Outer context is #{ctx.outer.name}")
+			log(stderr, "Finding member #{name} in #{contextTypeString(ctx)} #{ctx.name}")
+			findMemberInTypeTree(name, ctx.tree, true, seen)
 
 		else if ctx.members[name]
-			console.log("findMemberInContext '#{name}' in context '#{ctx.name}' : Found")
-			ctx.members[name].typTree
+			record = ctx.members[name]
+			log(stderr, "Found #{name} in #{contextTypeString(ctx)} #{ctx.name}")
+			record
 
-	if typTree
-		typTree
+	if record
+		record
 	else
-		findMemberInContext(name, ctx.outer)
+		findMemberInContext(name, ctx.outer, seen)
 
 # Finds the named member in the type defined by the given tree.
-# Returns undefined if the name is not a member of the given type tree.
-findMemberInTypeTree = (name, tree, useLowerBound) ->
+# Returns the symbol registration record if it is found in the type tree, otherwise returns undefined.
+findMemberInTypeTree = (name, tree, useLowerBound, seen) ->
+
+	if tree and tree.type
+		log(stderr, "Finding member #{name} in #{tree.type} tree")
+	else
+		log(stderr, "Finding member #{name} in #{tree} tree")
 
 	if not tree
-		throw "Error: Request for member '#{name}' from an undefined type"
+		throw new Error("Request for member '#{name}' from an undefined type")
+
+	if not seen
+		seen = { }
+		seen[name] = [tree]
+	else if not seen[name]
+		seen[name] = [tree]
+	else if tree in seen[name]
+		log(stderr, "Circular request for #{name} in context #{tree.ctx.name} is rejected")
+		#trees = (for tr in seen
+		#	tree.stringify(0))
+		#throw "Internal compiler error: Circular reference during lookup of #{name}.\nTrees:\n\n" + trees.join("\n\n")
+		return undefined
+	else
+		seen[name] = seen[name].concat(tree)
 
 	if tree.type is "STATEMENTS"
+		log(stderr, "Found member #{name} in statement block #{tree.ctx.name}")
 		tree.ctx.members[name]
+
+	else if tree.type is "CONSTRUCT"
+		findMemberInTypeTree(name, tree.typTree, useLowerBound, seen)
 
 	else if tree.type is "ANY"
 		undefined   # same as requesting a member of an empty statement block
@@ -605,26 +669,28 @@ findMemberInTypeTree = (name, tree, useLowerBound) ->
 		TypeBounds(Nothing, Any)   # the name is defined (because Nothing defines all names), but we don't know anything about it. So assign maximal bounds.
 
 	else if tree.type is "TYPE-SELECT"
-		wt = widen(tree)
+		log(stderr, "Finding #{name} in type selection member #{tree.ID}")
+		wt = widen(tree, seen)
 		if not wt
 			throw "Error: Cannot find definition of '#{tree.ID}' on line #{tree.line} character #{tree.column}"
-		findMemberInTypeTree(name, wt, useLowerBound)
+		findMemberInTypeTree(name, wt, useLowerBound, seen)
 
 	else if tree.type is "ID"
-		wt = widen(tree)
+		log(stderr, "Finding #{name} in type #{tree.match}")
+		wt = widen(tree, seen)
 		if not wt
 			throw "Error: Cannot find definition of '#{tree.match}' on line #{tree.line} character #{tree.column}"
-		findMemberInTypeTree(name, wt, useLowerBound)
+		findMemberInTypeTree(name, wt, useLowerBound, seen)
 
 	else if tree.type is "TYPE-BOUNDS"
 		if useLowerBound
-			findMemberInTypeTree(name, tree.lower, useLowerBound)
+			findMemberInTypeTree(name, tree.lower, useLowerBound, seen)
 		else
-			findMemberInTypeTree(name, tree.upper, useLowerBound)
+			findMemberInTypeTree(name, tree.upper, useLowerBound, seen)
 
 	else if tree.type is "AND-TYPE"
-		lhs = findMemberInTypeTree(name, tree.lhs, useLowerBound)
-		rhs = findMemberInTypeTree(name, tree.rhs, useLowerBound)
+		lhs = findMemberInTypeTree(name, tree.lhs, useLowerBound, seen)
+		rhs = findMemberInTypeTree(name, tree.rhs, useLowerBound, seen)
 		if lhs and rhs
 			simplifyType(
 				TypeBounds(
@@ -639,8 +705,8 @@ findMemberInTypeTree = (name, tree, useLowerBound) ->
 			undefined  # the name is not defined on either side
 
 	else if tree.type is "OR-TYPE"
-		lhs = findMemberInTypeTree(name, tree.lhs, useLowerBound)
-		rhs = findMemberInTypeTree(name, tree.rhs, useLowerBound)
+		lhs = findMemberInTypeTree(name, tree.lhs, useLowerBound, seen)
+		rhs = findMemberInTypeTree(name, tree.rhs, useLowerBound, seen)
 		if lhs and rhs
 			simplifyType(
 				TypeBounds(
@@ -654,21 +720,23 @@ findMemberInTypeTree = (name, tree, useLowerBound) ->
 		throw "Internal compiler error : Expected a type tree in findMemberInTypeTree, got '#{tree.type}' tree"
 
 # Widens selections or identifiers to their declared types.
-widen = (tree) ->
+widen = (tree, seen) ->
 	if tree.type is "TYPE-SELECT"
-		prefixTypTree = widen(tree.prefix)
-		if not prefixTypTree
-			throw "Error: Cannot find definition of '#{tree.ID}' on line #{tree.line} character #{tree.column}"
-		findMemberInTypeTree(tree.ID, prefixTypTree)
+		prefixTypTree = widen(tree.prefix, seen)
+		log(stderr, "Finding #{tree.ID} in widened type")
+		findMemberInTypeTree(tree.ID, prefixTypTree, seen)
 
 	else if tree.type is "TERM-SELECT"
-		prefixTypTree = widen(tree.prefix)
-		if not prefixTypTree
-			throw "Error: Cannot find definition of '#{tree.id}' on line #{tree.line} character #{tree.column}"
-		findMemberInTypeTree(tree.id, prefixTypTree)
+		prefixTypTree = widen(tree.prefix, seen)
+		log(stderr, "Finding #{tree.id} in widened type")
+		findMemberInTypeTree(tree.id, prefixTypTree, seen)
 
-	else if tree.type is "ID" or tree.type is "id"
-		findMemberInContext(tree.match, tree.ctx)
+	else if tree.type in ["ID", "id"]
+		log(stderr, "Widening #{tree.match} on line #{tree.line}")
+		record = findMemberInContext(tree.match, tree.ctx, seen)
+		if not record
+			throw new Error("Cannot find definition of '#{tree.match}' on line #{tree.line} character #{tree.column}")
+		record.typTree
 
 	else
 		throw "Internal compiler error : Attempt to widen a non-named-type tree '#{tree.type}' on line #{tree.line} character #{tree.column}"
@@ -693,26 +761,31 @@ genStatementsFromTypeTree = (tree, ctorCtx, indent) ->
 	if tree.type is "STATEMENTS"
 		#ctx = if tree.ctx.outer is ctorCtx then ctorCtx else tree.ctx  # find out if we should use the current or constructor context
 		(for st in tree.statements
-			genStatementsFromTypeTree(st, ctorCtx, indent + 1)).join('')
+			genStatementsFromTypeTree(st, ctorCtx, indent)).join('')
 
 	else if tree.type is "TYPE-DECL"
 		assignto = "#{ctorCtx.name}.#{tree.lhs.match} = "
 		ctor = genMixinConstructor(tree.rhsLower, tree.rhsLower.ctx, indent)
 
-		tabs(indent) + assignto + ctor
+		tabs(indent) + assignto + ctor + ";\n"
+
+	else if tree.type is "TERM-DECL"
+		''  # no code for term decls
 
 	else if tree.type is "TYPE-SELECT"
 		[prefixJs, prefixTypTree] = genTerm(tree.prefix, ctorCtx, indent + 1)
-		typTree = findMemberInTypeTree(tree.ID, prefixTypTree)
-		if typTree
+		record = findMemberInTypeTree(tree.ID, prefixTypTree)
+		if record
 			tabs(indent) + "#{prefixJs}.#{tree.ID}(ctorCtx.name);\n"
 		else
 			throw "Error : Cannot find definition of '#{tree.id}' on line #{tree.line} character #{tree.column}"
 
 	else if tree.type is "ID"
-		typTree = findMemberInContext(tree.ID, ctorCtx)
-		if typTree
-			tabs(indent) + "#{enclosingConstructorContext(typTree.ctx).name}.#{tree.ID}();\n"
+		log(stderr, "(CodeGen) Looking up type of ID #{tree.match} in #{ctorCtx.name}")
+		record = findMemberInContext(tree.match, ctorCtx)
+		if record
+			origCtx = enclosingConstructorContext(record.ctx)
+			tabs(indent) + "#{origCtx.name}.#{tree.match}(#{ctorCtx.name});\n"
 		else
 			throw "Error : Cannot find definition of '#{tree.ID}' on line #{tree.line} character #{tree.column}"
 
@@ -744,17 +817,20 @@ genStatementsFromTypeTree = (tree, ctorCtx, indent) ->
 genTerm = (tree, ctx, indent) ->
 
 	if tree.type is "id"
-		typTree = findMemberInContext(tree.match, tree.ctx)
-		if typTree
-			["#{enclosingConstructorContext(typTree.ctx).name}.#{tree.match}", typTree]
+		log(stderr, "Starting code generation for id #{tree.match} in #{ctx.name}")
+		record = findMemberInContext(tree.match, ctx)
+		if record
+			origCtx = enclosingConstructorContext(record.ctx)
+			["#{origCtx.name}.#{tree.match}", record.typTree]
 		else
 			throw "Error : Cannot find definition of '#{tree.match}' on line #{tree.line} character #{tree.column}"
 
 	else if tree.type is "TERM-SELECT"
-		[prefixJs, prefixTypTree] = genTerm(tree, ctx, indent)
-		typTree = findMemberInTypeTree(tree.id, prefixTypTree)
-		if typTree
-			["#{prefixJs}.#{tree.id}", typTree]
+		log(stderr, "Starting code generation for term selection of #{tree.id}")
+		[prefixJs, prefixTypTree] = genTerm(tree.prefix, ctx, indent)
+		record = findMemberInTypeTree(tree.id, prefixTypTree)
+		if record
+			["#{prefixJs}.#{tree.id}", record.typTree]
 		else
 			throw "Error : Cannot find definition of '#{tree.id}' on line #{tree.line} character #{tree.column}"
 
