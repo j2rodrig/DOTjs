@@ -366,6 +366,25 @@ June 21.
 	Another issue is what to do about out-of-order statements. For now, nothing. Ideally, statements
 would be reordered based on depenency. But this doesn't have to happen yet.
 
+
+June 24.
+
+	I may need to re-think exactly how/when symbols are added to contexts. There are problems with circular references in symbol lookups.
+
+	1. Remove contexts on STATEMENTS trees, leaving only constructor/mixin-constructor contexts.
+	2. Constructor membership is evaluated lazily. Basically, requesting a member of a context forces
+	   computation of the entire memberhsip set for that context. For each constructor, the membership
+	   set is always computed before any element is selected from it.
+
+	Possible way to break this approach:
+		x: L
+		L: x.K   // the membership of L depends on a member of L. It's probably OK to treat this as an error
+
+	Possible counter-counter example:
+	L: {
+		H: at most L   // OK. The mixin context surrounding L here is evaluated lazily, so all members of L are established before we get here.
+	}
+
 ###
 
 Any =
@@ -442,7 +461,7 @@ contextTypeString = (ctx) ->
 	if ctx.isConstructor then s.push "constructor"
 	if ctx.isMixinConstructor then s.push "mixin-constructor"
 	s.push "context"
-	s.join("")
+	s.join(" ")
 
 registerSymbols = (tree, ctx) ->
 
@@ -617,7 +636,8 @@ findMemberInContext = (name, ctx, seen) ->  #TODO: optional filtering of public/
 			if not ctx.tree
 				throw Error("Internal compiler error: Context #{ctx.name} is not associated with a tree. Outer context is #{ctx.outer.name}")
 			log(stderr, "Finding member #{name} in #{contextTypeString(ctx)} #{ctx.name}")
-			findMemberInTypeTree(name, ctx.tree, true, seen)
+			typTree = if ctx.tree.type is "CONSTRUCT" then ctx.tree.typTree else ctx.tree
+			findMemberInTypeTree(name, typTree, true, seen)
 
 		else if ctx.members[name]
 			record = ctx.members[name]
@@ -658,9 +678,6 @@ findMemberInTypeTree = (name, tree, useLowerBound, seen) ->
 	if tree.type is "STATEMENTS"
 		log(stderr, "Found member #{name} in statement block #{tree.ctx.name}")
 		tree.ctx.members[name]
-
-	else if tree.type is "CONSTRUCT"
-		findMemberInTypeTree(name, tree.typTree, useLowerBound, seen)
 
 	else if tree.type is "ANY"
 		undefined   # same as requesting a member of an empty statement block
@@ -737,6 +754,9 @@ widen = (tree, seen) ->
 		if not record
 			throw new Error("Cannot find definition of '#{tree.match}' on line #{tree.line} character #{tree.column}")
 		record.typTree
+
+	else if tree.type is "CONSTRUCT"   # can be the prefix of a term widening
+		tree.typTree
 
 	else
 		throw "Internal compiler error : Attempt to widen a non-named-type tree '#{tree.type}' on line #{tree.line} character #{tree.column}"

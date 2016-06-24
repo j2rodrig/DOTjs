@@ -376,6 +376,25 @@
   
   	Another issue is what to do about out-of-order statements. For now, nothing. Ideally, statements
   would be reordered based on depenency. But this doesn't have to happen yet.
+  
+  
+  June 24.
+  
+  	I may need to re-think exactly how/when symbols are added to contexts. There are problems with circular references in symbol lookups.
+  
+  	1. Remove contexts on STATEMENTS trees, leaving only constructor/mixin-constructor contexts.
+  	2. Constructor membership is evaluated lazily. Basically, requesting a member of a context forces
+  	   computation of the entire memberhsip set for that context. For each constructor, the membership
+  	   set is always computed before any element is selected from it.
+  
+  	Possible way to break this approach:
+  		x: L
+  		L: x.K   // the membership of L depends on a member of L. It's probably OK to treat this as an error
+  
+  	Possible counter-counter example:
+  	L: {
+  		H: at most L   // OK. The mixin context surrounding L here is evaluated lazily, so all members of L are established before we get here.
+  	}
    */
 
   Any = {
@@ -474,7 +493,7 @@
       s.push("mixin-constructor");
     }
     s.push("context");
-    return s.join("");
+    return s.join(" ");
   };
 
   registerSymbols = function(tree, ctx) {
@@ -655,7 +674,7 @@
   };
 
   findMemberInContext = function(name, ctx, seen) {
-    var record;
+    var record, typTree;
     if (!ctx) {
       log(stderr, name + " was not found");
       return void 0;
@@ -666,7 +685,8 @@
           throw Error("Internal compiler error: Context " + ctx.name + " is not associated with a tree. Outer context is " + ctx.outer.name);
         }
         log(stderr, "Finding member " + name + " in " + (contextTypeString(ctx)) + " " + ctx.name);
-        return findMemberInTypeTree(name, ctx.tree, true, seen);
+        typTree = ctx.tree.type === "CONSTRUCT" ? ctx.tree.typTree : ctx.tree;
+        return findMemberInTypeTree(name, typTree, true, seen);
       } else if (ctx.members[name]) {
         record = ctx.members[name];
         log(stderr, "Found " + name + " in " + (contextTypeString(ctx)) + " " + ctx.name);
@@ -704,8 +724,6 @@
     if (tree.type === "STATEMENTS") {
       log(stderr, "Found member " + name + " in statement block " + tree.ctx.name);
       return tree.ctx.members[name];
-    } else if (tree.type === "CONSTRUCT") {
-      return findMemberInTypeTree(name, tree.typTree, useLowerBound, seen);
     } else if (tree.type === "ANY") {
       return void 0;
     } else if (tree.type === "NOTHING") {
@@ -772,6 +790,8 @@
         throw new Error("Cannot find definition of '" + tree.match + "' on line " + tree.line + " character " + tree.column);
       }
       return record.typTree;
+    } else if (tree.type === "CONSTRUCT") {
+      return tree.typTree;
     } else {
       throw "Internal compiler error : Attempt to widen a non-named-type tree '" + tree.type + "' on line " + tree.line + " character " + tree.column;
     }
