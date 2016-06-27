@@ -413,7 +413,7 @@ createGlobalContext = (tree) ->
 	ctx.addSymbol("Nothing", Nothing)
 	ctx
 
-freshContext = (outer, tree) ->
+freshContext = (outer) ->
 	ctx = {}
 
 	if outer
@@ -427,27 +427,114 @@ freshContext = (outer, tree) ->
 
 	ctx.name = "c#{ctx.nestLevel}"
 
-	if tree?
-		ctx.tree = tree
-		tree.ctx = ctx   # also allow moving from tree to context
-
 	ctx.members = {}
 
-	ctx.fresh = (tr) -> freshContext(ctx, tr)
+	ctx.fresh = () -> freshContext(ctx)
 
-	ctx.addSymbol = (name, typTree, meta) ->
+	ctx.addSymbol = (name, typTree) ->
 		if ctx.members[name]
 			throw "Error : Duplicate definition of '#{name}' at line #{typTree.line} character #{typTree.column}"
-		if ctx.tree then log(stderr, "(Symbols) Registering name #{name} in context #{ctx.name}")
+		log(stderr, "(Symbols) Registering name #{name} in context #{ctx.name}")
 		record = if ctx.members[name] then ctx.members[name] else
 			name: name
-			ctx: ctx  # convenience: remember which context registered the symbol (we need this for codegen)
 			typTree: typTree
-			meta: meta
 		ctx.members[name] = record
 
 	ctx
 
+findMemberInContext = (name, ctx) ->
+	if ctx.members[name]
+		[ctx, ctx.members[name]]
+	else if not ctx
+		undefined
+	else
+		findMemberInContext(name, ctx.outer)
+
+requireMemberInContext = (name, ctx, tree) ->
+	recordWithContext = findMemberInContext(name, ctx)
+	if not recordWithContext
+		throw new Error("Name '#name' is not defined at line #{tree.line} character #{tree.column}")
+	recordWithContext
+
+
+
+# We need 2 things here:
+#  Named Base Types
+#  Type members (requires finding all statements)
+
+getBaseTypes = (typTree, ctx) ->
+
+	if typTree.type in ["ID", "TYPE-SELECT"]
+		[typTree]
+	else if typTree.type is "TYPE-BOUNDS"
+		# Get lower bound of TypeBounds types.
+		getBaseTypes(typTree.lower, ctx)
+	else if typTree.type is "AND-TYPE"
+		# AndTypes include bases from both the left-hand side and the right-hand side of the AndType.
+		getBaseTypes(typTree.lhs, ctx).concat(getBaseTypes(typTree.rhs, ctx))
+	else if typTree.type is "OR-TYPE"
+		# Choose either the right-hand side or the left-hand side of the OrType.
+		# Here, we choose the left-hand side unless one of its base types is Nothing.
+		# (NOTE I don't follow type aliases here, so it is still possible that the LHS is
+		#  non-constructible even if none of its immediate bases is Nothing.
+		#  I don't know if this behaviour is reasonable or not.)
+		lhsBases = getBaseTypes(typTree.lhs, ctx)
+		rhsBases = getBaseTypes(typTree.rhs, ctx)
+		for b in lhsBases
+			if b is Nothing or b.match is "Nothing"
+				return rhsBases
+		lhsBases
+	else if typTree.type is "STATEMENTS"
+		# A statement block is an anonymous (rather than named) type, so return an empty list of bases
+		[]
+	else
+		throw new Error("Internal compiler error: Expected a type tree in getBaseTypes, got #{typTree.type} tree")
+
+registerMembers = (typTree, ctx) ->
+
+	if typTree is "STATEMENTS"
+		for st in typTree.statements
+
+			if st is "TYPE-DECL"
+				existing = ctx.members[st.lhs.match]
+				if not existing
+					ctx.addSymbol(st.lhs.match, TypeBounds(st.rhsLower, st.rhsUpper))
+				else
+					existing.typTree = TypeBounds(simplifyType(OrType(st.rhsLower, existing.typTree.lower)),
+						simplifyType(AndType(st.rhsUpper, existing.typTree.upper)))
+
+			else if st is "TERM-DECL"
+				existing = ctx.members[st.lhs.match]
+				if not existing
+					ctx.addSymbol(st.lhs.match, st.rhs, treeCtx)
+				else
+					#TODO: check that new term type is compatible with existing term type.
+
+	else if typTree is "ID"
+		[idCtx, idRecord] = requireMemberInContext(typTree.lhs.match, ctx.outer, typTree.lhs)
+		registerMembers(idRecord.typTree, ctx)
+
+	else if typTree is "TYPE-SELECT"
+		[prefixCtx, prefixRecord] = widen(typTree.prefix, ctx.outer)
+		record = prefixCtx.members[typTree.ID]
+		if not record
+			throw new Error("'#{record.name}' is not a member of #{typTree.prefix.stringify()} on line #{typTree.line} character #{typTree.column}")
+		registerMembers(record.typTree, ctx)
+
+	else if typTree is "AND-TYPE"
+
+
+widen = (typTree, treeCtx) ->
+	if typTree is "id"
+		requireMemberInContext(typTree.match, treeCtx, typTree)
+	else if typTree is "TERM-SELECT"
+		record = widen(typTree.prefix, treeCtx)
+		existing = record.ctx.members[typTree.id]
+		if not existing
+			throw new Error("'#{existing.name}' is not a member of #{typTree.prefix.stringify()} on line #{typTree.line} character #{typTree.column}")
+
+
+### deprecated
 enclosingConstructorContext = (ctx) ->
 	if ctx.isConstructor or ctx.isMixinConstructor
 		ctx
@@ -471,8 +558,8 @@ registerSymbols = (tree, ctx) ->
 		ctx = ctx.fresh(tree)
 		ctx.isConstructor = true
 
-	else if tree.type is "STATEMENTS"
-		ctx = ctx.fresh(tree)  # generate a fresh context to hold declarations contained in the statement block
+	#else if tree.type is "STATEMENTS"
+	#	ctx = ctx.fresh(tree)  # generate a fresh context to hold declarations contained in the statement block
 
 	else if tree.type is "TERM-DECL"
 		ctx.addSymbol(tree.lhs.match, tree.rhs)
@@ -487,6 +574,8 @@ registerSymbols = (tree, ctx) ->
 	if tree.subtrees
 		for subtree in tree.subtrees()
 			registerSymbols(subtree, ctx)
+###
+
 
 ### TYPE OPERATIONS ###
 
@@ -556,6 +645,8 @@ simplifyType = (tree) ->
 
 
 ### MEMBERSHIP ###
+
+### deprecated ->>
 
 # Finds named members of the given type tree in linearization order.
 # Returns Nothing if the set of named members is non-finite.
@@ -760,10 +851,42 @@ widen = (tree, seen) ->
 
 	else
 		throw "Internal compiler error : Attempt to widen a non-named-type tree '#{tree.type}' on line #{tree.line} character #{tree.column}"
-
+<<-- ###
 
 ### CODEGEN ###
 
+genConstructor = (tree, ctx, indent) ->
+	#
+	# Constructor
+	# The first difference between a constructor and an initializer is that a constructor contains calls to
+	# supertype (mixin) initializers. Constructors in DOTjs are always for unnamed types, so constructors
+	# can never call other constructors directly.
+	#
+	ctx = ctx.fresh(tree)
+	regDeclaredMembers(ctx)
+	regTypeAssignments(ctx)
+	superInits = genSupertypeInitializerCalls(tree, ctx, indent + 1)
+	"function(#{ctx.name}){\n" + superInits + "#{tabs(indent)}}"
+
+genInitializer = (tree, ctx, indent) ->
+	#
+	# Initializer
+	# An initializer contains term statements that must be executed when a named type (mixin) is used to
+	# construct an object. An initializer never calls other initializers directly -- calling supertype
+	# initializers is a task left to constructors. (Constructors are better able to do linearization of
+	# initializers because it is easier to prevent duplicate initializer calls at the constructor.)
+	# Since initializers do not call other initializers, the only statements 
+	#
+	ctx = ctx.fresh(tree)
+	regDeclaredMembers(ctx)
+	stmts = genTermStatments(tree, ctx, indent + 1)
+	"function(#{ctx.name}){\n" + stmts + "#{tabs(indent)}}"
+
+
+
+
+### CODEGEN deprecated ###
+###
 genConstructor = (typTree, ctorCtx, indent) ->
 
 	"(" + genMixinConstructor(typTree, ctorCtx, indent) + ")({})"
@@ -862,7 +985,7 @@ genTerm = (tree, ctx, indent) ->
 
 	else
 		throw "Error : In genTerm, expected TERM tree, got #{tree.type} tree on line #{tree.line} character #{tree.column}"
-
+###
 
 ### PARSER ###
 
