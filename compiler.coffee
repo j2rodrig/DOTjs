@@ -13,15 +13,16 @@ window.compile = (input, stopAfter) ->
 		if stopAfter == "trees"
 			return ast.print(0)
 
-		globalCtx = createGlobalContext()
-		programInstantiateCtx = globalCtx.fresh(ast)
-		programInstantiateCtx.isConstructor = true   # treat the entire program as a single constructor
-		registerSymbols(ast, programInstantiateCtx)
+		predefCtx = createPredefContext()   # create a context for predefined types
+		doTypeCompleters(ast, predefCtx.fresh(ast))   # generate subcontexts and info() functions
 
 		if stopAfter == "symbols"
 			printSymbolTables(ast)
 
-		output = genConstructor(ast, enclosingConstructorContext(ast.ctx), 0) + ";"
+		outputBuffer = []
+		genConstructor(ast, 0, outputBuffer)
+		outputBuffer.push(";")
+		output = outputBuffer.join("")
 
 		logText = if channels[stderr] then "/** Stderr log:\n\n" + channels[stderr].join("\n") + "\n**/" else ""
 
@@ -389,12 +390,25 @@ June 24.
 
 Any =
 	type: "ANY"
-	alttypes: undefined
 	line: "(built-in)"
 	column: "(built-in)"
 
 Nothing =
     type: "NOTHING"
+	line: "(built-in)"
+	column: "(built-in)"
+
+AndType = (lhsTyp, rhsTyp) ->
+	type: "AND-TYPE"
+	lhs: lhsTyp
+	rhs: rhsTyp
+	line: "(built-in)"
+	column: "(built-in)"
+
+OrType = (lhsTyp, rhsTyp) ->
+	type: "OR-TYPE"
+	lhs: lhsTyp
+	rhs: rhsTyp
     alttypes: undefined
 	line: "(built-in)"
 	column: "(built-in)"
@@ -407,13 +421,25 @@ TypeBounds = (typLower, typUpper) ->
 
 ### CONTEXTS AND SYMBOLS ###
 
-createGlobalContext = (tree) ->
-	ctx = freshContext(tree)
-	ctx.addSymbol("Any", Any)
-	ctx.addSymbol("Nothing", Nothing)
+createPredefContext = () ->
+	predefTree =
+		type: "STATEMENTS"
+		statements: []
+	predefTree.statements.push TypeDecl(
+		Token("ID", "Any", undefined, undefined),
+		Any, Any
+	)
+	predefTree.statements.push TypeDecl(
+		Token("ID", "Nothing", undefined, undefined),
+		Nothing, Nothing
+	)
+	ctx = freshContext(undefined, predefTree)
+	Any.ctx = ctx   # hack: make the contexts of predefined types point to the predef context
+	Nothing.ctx = ctx
 	ctx
 
-freshContext = (outer) ->
+
+freshContext = (outer, typTree) ->
 	ctx = {}
 
 	if outer
@@ -427,10 +453,12 @@ freshContext = (outer) ->
 
 	ctx.name = "c#{ctx.nestLevel}"
 
-	ctx.members = {}
+	ctx.fresh = (typTree) -> freshContext(ctx, typTree)
 
-	ctx.fresh = () -> freshContext(ctx)
+	ctx.findMember = (name) ->
+		findMember(name, typTree, ctx.outer)
 
+	###
 	ctx.addSymbol = (name, typTree) ->
 		if ctx.members[name]
 			throw "Error : Duplicate definition of '#{name}' at line #{typTree.line} character #{typTree.column}"
@@ -440,56 +468,329 @@ freshContext = (outer) ->
 			typTree: typTree
 		ctx.members[name] = record
 
+	ctx.ensureMembersDefined = () ->
+		if not ctx.members?
+			ctx.members = {}
+			typTree.regMembers()
+		ctx.members
+
+	ctx.info = () ->  # represents the membership of this context as a type. TODO: do we need this?
+		ctx.ensureMembersDefined()
+		#typTree = Any
+		#for name, typ of ctx.members
+		#	typTree = AndType(typTree, )
+	###
+
 	ctx
 
+findMember = (name, typTree, ctx) ->  # params: name to find, type tree to look into, enclosing context to resolve type/term names in the type tree
+
+	if typTree.type is "CONSTRUCT"
+		findMember(name, typTree.typTree, typTree.typTree.ctx)
+
+	else if typTree.type is "STATEMENTS"
+		found = undefined
+		for st in typTree.statements
+			if st.type is "TYPE-DECL" and st.lhs.match is name
+				if found then throw new Error("Duplicate definition of '#{name}' on line #{st.lhs.line} character #{st.lhs.column}")
+				found = st.rhsUpper
+			else if st.type is "TERM-DECL" and st.lhs.match is name
+				if found then throw new Error("Duplicate definition of '#{name}' on line #{st.lhs.line} character #{st.lhs.column}")
+				found = st.rhs
+		found
+
+	else if typTree.type is "ID"
+		widenedIdTree = widen(typTree, ctx.outer)
+		findMember(name, widenedIdTree, widenedIdTree.ctx)
+
+	else if typTree.type is "TYPE-SELECT"
+		widenedTyp = widen(typTree, ctx.outer)
+		findMember(name, widenedTyp, widenedTyp.ctx)
+
+	else if typTree.type is "TYPE-BOUNDS"
+
+	else if typTree.type is "AND-TYPE"
+		lhsType = findMember(name, typTree.lhs, ctx)
+		rhsType = findMember(name, typTree.rhs, ctx)
+		if not lhsType
+			rhsType
+		else if not rhsType
+			lhsType
+		else
+			AndType(lhsType, rhsType)
+
+widen = (tree, ctx) ->
+	if tree.type is "id"
+		requireMemberInContext(tree.match, ctx, tree)
+	else if tree.type is "ID"
+		requireMemberInContext(tree.match, ctx, tree)
+	else if tree.type is "TERM-SELECT"
+		prefixTyp = widen(tree.prefix, ctx)
+		requireMemberInType(tree.id, prefixTyp, tree)
+	else if tree.type is "TYPE-SELECT"
+		prefixTyp = widen(tree.prefix, ctx)
+		requireMemberInType(tree.ID, prefixTyp, tree)
+
 findMemberInContext = (name, ctx) ->
-	if ctx.members[name]
-		[ctx, ctx.members[name]]
-	else if not ctx
+	if not ctx
 		undefined
 	else
-		findMemberInContext(name, ctx.outer)
+		found = ctx.findMember(name)
+		if found
+			found
+		else
+			findMemberInContext(name, ctx.outer)
 
-requireMemberInContext = (name, ctx, tree) ->
-	recordWithContext = findMemberInContext(name, ctx)
-	if not recordWithContext
-		throw new Error("Name '#name' is not defined at line #{tree.line} character #{tree.column}")
-	recordWithContext
+# Finds the context that defines the given name, if it is in ctx or enclosing.
+getDefContext = (name, ctx) ->
+	if not ctx
+		undefined
+	else
+		if ctx.findMember(name)
+			ctx
+		else
+			getDefContext(name, ctx.outer)
 
+# Throws an error if the given name is not defined in the given or enclosing contexts.
+requireMemberInContext = (name, ctx, sourceTree) ->
+	typTree = findMemberInContext(name, ctx)
+	if not typTree
+		throw new Error("Name '#{name}' is not defined at line #{sourceTree.line} character #{sourceTree.column}")
+	typTree
+
+requireMemberInType = (name, typTree, sourceTree) ->
+	found = findMember(name, typTree)
+	if not found
+		throw new Error("Member '#{name}' at line #{sourceTree.line} character #{sourceTree.column} could not be found")
+	found
+
+requireDefContext = (name, ctx, sourceTree) ->
+	found = getDefContext(name, ctx)
+	if not found
+		throw new Error("Name '#{name}' is not defined at line #{sourceTree.line} character #{sourceTree.column}")
+	found
 
 
 # We need 2 things here:
 #  Named Base Types
 #  Type members (requires finding all statements)
 
-getBaseTypes = (typTree, ctx) ->
+getBaseTypes = (typTree) ->
 
 	if typTree.type in ["ID", "TYPE-SELECT"]
 		[typTree]
 	else if typTree.type is "TYPE-BOUNDS"
 		# Get lower bound of TypeBounds types.
-		getBaseTypes(typTree.lower, ctx)
+		getBaseTypes(typTree.lower)
 	else if typTree.type is "AND-TYPE"
 		# AndTypes include bases from both the left-hand side and the right-hand side of the AndType.
-		getBaseTypes(typTree.lhs, ctx).concat(getBaseTypes(typTree.rhs, ctx))
+		getBaseTypes(typTree.lhs).concat(getBaseTypes(typTree.rhs))
 	else if typTree.type is "OR-TYPE"
 		# Choose either the right-hand side or the left-hand side of the OrType.
 		# Here, we choose the left-hand side unless one of its base types is Nothing.
 		# (NOTE I don't follow type aliases here, so it is still possible that the LHS is
 		#  non-constructible even if none of its immediate bases is Nothing.
 		#  I don't know if this behaviour is reasonable or not.)
-		lhsBases = getBaseTypes(typTree.lhs, ctx)
-		rhsBases = getBaseTypes(typTree.rhs, ctx)
+		lhsBases = getBaseTypes(typTree.lhs)
+		rhsBases = getBaseTypes(typTree.rhs)
 		for b in lhsBases
 			if b is Nothing or b.match is "Nothing"
 				return rhsBases
 		lhsBases
 	else if typTree.type is "STATEMENTS"
-		# A statement block is an anonymous (rather than named) type, so return an empty list of bases
-		[]
+		[typTree]
 	else
 		throw new Error("Internal compiler error: Expected a type tree in getBaseTypes, got #{typTree.type} tree")
 
+doTypeCompleters = (tree, ctx) ->
+
+	tree.ctx = ctx
+
+	if tree.type is "STATEMENTS"
+		for st in tree.statements
+			doStatementCompleters(st, ctx)
+
+	else if tree.type is "ID"
+		# TODO?
+
+	else if tree.type is "TYPE-SELECT"
+		doTermCompleters(tree.prefix, ctx)
+
+	else if tree.type is "AND-TYPE" or tree.type is "OR-TYPE"
+		doTypeCompleters(tree.lhs, ctx)
+		doTypeCompleters(tree.rhs, ctx)
+
+	else
+		throw new Error("Unexpected #{tree.type} tree in doTypeCompleters")
+
+
+doTermCompleters = (tree, ctx) ->
+
+	if tree.type is "id"
+		tree.info = () ->
+			requireMemberInContext(tree.match, ctx, tree)
+
+	else if tree.type is "TERM-SELECT"
+		tree.info = () ->
+			requireMemberInType(tree.id, tree.prefix.info(), tree)
+		doTermCompleters(tree.prefix, ctx)
+
+	else if tree.type is "CONSTRUCT"
+		ctx = ctx.fresh(tree)
+		# Note on info() functions: The invariant of info() is that it always returns a type tree (not a statement or a term).
+		# There are at least two variants on info(): return the type tree as-is, or return a STATEMENTS tree containing linearized declarations.
+		#  (We do the former here.)
+		tree.info = () ->
+			tree.typTree
+		doTypeCompleters(tree.typTree, ctx)
+
+	else
+		throw new Error("Unexpected #{tree.type} tree in doTermCompleters")
+
+doStatementCompleters = (tree, ctx) ->
+	if tree.type is "TERM-DECL"
+		doTypeCompleters(tree.rhs, ctx)
+
+	else if tree.type is "TYPE-DECL"
+		doTypeCompleters(tree.rhsLower, ctx.fresh(tree.rhsLower))
+		doTypeCompleters(tree.rhsUpper, ctx.fresh(tree.rhsUpper))
+
+	else if tree.type is "TYPE-ASSIGN"
+		doTypeCompleters(tree.lhs, ctx)
+		doTypeCompleters(tree.rhs, ctx)
+
+	else if tree.type is "TERM-ASSIGN"
+		doTermCompleters(tree.lhs, ctx)
+		doTermCompleters(tree.rhs, ctx)
+
+	else
+		doTermCompleters(tree, ctx)  # assume anything else is a term
+
+
+
+gen = (tree, ctx, indent, output) ->
+
+	if tree.type is "STATEMENTS"
+		for st in tree.statements
+			if st.type is "TYPE-DECL"   # TODO: we should really be hoisting these out of statement blocks and into their enclosing constructors
+				output.push(tabs(indent))
+				defCtx = requireDefContext(st.lhs.match, ctx, tree)
+				output.push("#{defCtx.name}.#{st.lhs.match}")
+				output.push(" = ")
+				genInitializer(st.rhsLower, indent, output)
+				output.push(";\n")
+
+		for st in tree.statements
+			if st.type is "TERM-ASSIGN"
+				lhsType = st.lhs.info()
+				rhsType = st.rhs.info()
+				# TODO: check for rhs <: lhs compatibility
+				output.push(tabs(indent))
+				gen(st.lhs, ctx, indent, output)
+				output.push(" = ")
+				gen(st.rhs, ctx, indent, output)
+				output.push(";\n")
+			else if st.type in ["id", "TERM-SELECT", "CONSTRUCT"]
+				output.push(tabs(indent))
+				gen(st, ctx, indent, output)
+				output.push(";\n")
+
+	else if tree.type is "CONSTRUCT"
+		genConstructor(tree.typTree, indent, output)
+
+	else if tree.type is "id"
+		defCtx = requireDefContext(tree.match, ctx, tree)
+		output.push("#{defCtx.name}.#{tree.match}")
+
+	else if tree.type is "TERM-SELECT"
+		gen(tree.prefix, ctx, indent, output)
+		output.push(".")
+		output.push(tree.id)
+
+genInitializer = (tree, indent, output) ->
+	ctx = tree.ctx
+	output.push("function(#{tree.ctx.name}){\n")
+	bases = getBaseTypes(tree)   # TODO remove duplicates?
+
+	# Here, generate statements only. Calls to other initializers should really be hoisted into constructors
+	for base in bases
+		if base.type is "STATEMENTS"
+			gen(base, ctx, indent + 1, output)
+
+	output.push(tabs(indent))
+	output.push("}")
+
+genConstructor = (tree, indent, output) ->
+	ctx = tree.ctx
+	output.push("(function(#{tree.ctx.name}){\n")
+	bases = getBaseTypes(tree)   # TODO remove duplicates?
+
+	for base in bases
+		if base.type is "STATEMENTS"
+			gen(base, ctx, indent + 1, output)
+		else if base.type is "ID"
+			defCtx = requireDefContext(base.match, ctx.outer, base)
+			output.push(tabs(indent + 1))
+			output.push("#{defCtx.name}.#{base.match}(#{ctx.name});\n")
+		else if base.type is "TYPE-SELECT"
+			output.push(tabs(indent + 1))
+			gen(base.prefix, ctx.outer, indent + 1, output)
+			output.push(".#{base.ID}(#{ctx.name});\n")
+
+	output.push(tabs(indent))
+	output.push("})({})")
+
+
+###
+#
+# Associate trees with deferred info functions. Contexts are also created to hold members and support lookups.
+#
+contextify = (tree, ctx, mode) ->
+
+	if tree.type is "CONSTRUCT"
+		ctx = ctx.fresh(tree)
+		mode = "CONSTRUCT"
+		tree.info = () -> tree.typTree.info()
+		tree.regMembers = () -> tree.typTree.regMembers()
+
+	else if tree.type in ["ID", "id"]
+		tree.info = () ->
+			ctxToCheck = if mode is "CONSTRUCT" ctx.outer else ctx
+			requireMemberInContext(tree.match, ctxToCheck, tree)
+		tree.regMembers = () ->
+
+	else if tree.type is "TYPE-SELECT"
+		tree.info = () ->
+			tree.prefix.info().typTree.ctx.ensureMembersDefined()[tree.ID]
+
+	else if tree.type is "STATEMENTS"
+
+		tree.regMembers = () ->
+			for st in tree.statements
+				if st.regMembers
+					st.regMembers()
+
+	else if tree.type is "TYPE-DECL"
+		tree.ctx = ctx
+		tree.mode = mode
+		typTree = TypeBounds(st.rhsLower, st.rhsUpper)
+		ctx = ctx.fresh(tree)   # create a membership context for type-related queries on this named declaration
+		mode = "CONSTRUCT"
+		tree.regMembers = () ->
+			ctx.addSymbol(tree.lhs.match, )
+		contextify(typTree, ctx, mode)
+		return  # skip automatic recursion below
+
+	tree.ctx = ctx
+	tree.mode = mode
+
+	if tree.subtrees?
+		for st in tree.subtrees()
+			st.contextify(st, ctx, mode)
+###
+
+
+###
 registerMembers = (typTree, ctx) ->
 
 	if typTree is "STATEMENTS"
@@ -498,15 +799,16 @@ registerMembers = (typTree, ctx) ->
 			if st is "TYPE-DECL"
 				existing = ctx.members[st.lhs.match]
 				if not existing
-					ctx.addSymbol(st.lhs.match, TypeBounds(st.rhsLower, st.rhsUpper))
+					ctx.addSymbol(st.lhs.match, () -> TypeBounds(st.rhsLower, st.rhsUpper))
 				else
-					existing.typTree = TypeBounds(simplifyType(OrType(st.rhsLower, existing.typTree.lower)),
-						simplifyType(AndType(st.rhsUpper, existing.typTree.upper)))
+					existing.typFn = () ->
+						TypeBounds(simplifyType(OrType(st.rhsLower, existing.typTree.lower)),
+							simplifyType(AndType(st.rhsUpper, existing.typTree.upper)))
 
 			else if st is "TERM-DECL"
 				existing = ctx.members[st.lhs.match]
 				if not existing
-					ctx.addSymbol(st.lhs.match, st.rhs, treeCtx)
+					ctx.addSymbol(st.lhs.match, () -> st.rhs)
 				else
 					#TODO: check that new term type is compatible with existing term type.
 
@@ -522,8 +824,9 @@ registerMembers = (typTree, ctx) ->
 		registerMembers(record.typTree, ctx)
 
 	else if typTree is "AND-TYPE"
+###
 
-
+###
 widen = (typTree, treeCtx) ->
 	if typTree is "id"
 		requireMemberInContext(typTree.match, treeCtx, typTree)
@@ -532,7 +835,7 @@ widen = (typTree, treeCtx) ->
 		existing = record.ctx.members[typTree.id]
 		if not existing
 			throw new Error("'#{existing.name}' is not a member of #{typTree.prefix.stringify()} on line #{typTree.line} character #{typTree.column}")
-
+###
 
 ### deprecated
 enclosingConstructorContext = (ctx) ->
@@ -855,6 +1158,7 @@ widen = (tree, seen) ->
 
 ### CODEGEN ###
 
+###
 genConstructor = (tree, ctx, indent) ->
 	#
 	# Constructor
@@ -881,7 +1185,7 @@ genInitializer = (tree, ctx, indent) ->
 	regDeclaredMembers(ctx)
 	stmts = genTermStatments(tree, ctx, indent + 1)
 	"function(#{ctx.name}){\n" + stmts + "#{tabs(indent)}}"
-
+###
 
 
 
@@ -1000,6 +1304,21 @@ Token = (tokType, text, line, column) ->
 	tk.print = () -> "#{tk.type}, \"#{tk.match.replace('\n', '\\n')}\", line #{tk.line}, character #{tk.column}"
 	tk
 
+TypeDecl = (lhs, rhsLower, rhsUpper) ->
+	t =
+		type: "TYPE-DECL"
+		alttypes: ["STATEMENT"]
+		lhs: lhs
+		rhsLower: rhsLower
+		rhsUpper: rhsUpper
+		line: lhs.line
+		column: lhs.column
+	t.stringify = (indent) -> t.lhs.stringify(indent) +
+		": at most " + t.rhsUpper.stringify(indent) +
+		" at least " + t.rhsLower.stringify(indent)
+	t.subtrees = () -> [t.lhs, t.rhsLower, t.rhsUpper]
+	t
+
 parse = (tokens) ->
 
 	stack = []
@@ -1114,7 +1433,7 @@ parse = (tokens) ->
 				id: id.match
 				line: id.line
 				column: id.column
-			t.stringify = (indent) -> t.prefix.stringify(indent) + ".#{t.id}#{strtyp(t,indent)}"
+			t.stringify = (indent) -> t.prefix.stringify(indent) + ".#{t.id}"
 			t.subtrees = () -> [t.prefix]
 			stack.push t
 			return true
@@ -1130,25 +1449,10 @@ parse = (tokens) ->
 				ID: ID.match
 				line: ID.line
 				column: ID.column
-			t.stringify = (indent) -> t.prefix.stringify(indent) + ".#{t.ID}#{strtyp(t,indent)}"
+			t.stringify = (indent) -> t.prefix.stringify(indent) + ".#{t.ID}"
 			t.subtrees = () -> [t.prefix]
 			stack.push t
 			return true
-
-		TypeDecl = (lhs, rhsLower, rhsUpper) ->
-			t =
-				type: "TYPE-DECL"
-				alttypes: ["STATEMENT"]
-				lhs: lhs
-				rhsLower: rhsLower
-				rhsUpper: rhsUpper
-				line: lhs.line
-				column: lhs.column
-			t.stringify = (indent) -> t.lhs.stringify(indent) +
-				": at most " + t.rhsUpper.stringify(indent) +
-				" at least " + t.rhsLower.stringify(indent) + strtyp(t,indent)
-			t.subtrees = () -> [t.lhs, t.rhsLower, t.rhsUpper]
-			t
 
 		if matches(["ID", "COLON", "*", "*", "*", "*", "NEWLINE"])
 			stack.pop()
@@ -1214,7 +1518,7 @@ parse = (tokens) ->
 					rhs: rhs
 					line: lhs.line
 					column: lhs.column
-				t.stringify = (indent) -> t.lhs.stringify(indent) + ": " + t.rhs.stringify(indent) + strtyp(t,indent)
+				t.stringify = (indent) -> t.lhs.stringify(indent) + ": " + t.rhs.stringify(indent)
 				t.subtrees = () -> [t.lhs, t.rhs]
 				stack.push t
 				return true
@@ -1311,20 +1615,23 @@ parse = (tokens) ->
 			stack.push stmts
 			return true
 
-		if matches(["TYPE", "DOT", "NEW"])
+		if matches(["*", "DOT", "NEW"])
 			nw = stack.pop()
 			stack.pop()
-			_typTree = stack.pop()
-			construct =
-				type: "CONSTRUCT"
-				alttypes: ["TERM"]
-				typTree: _typTree
-				line: nw.line
-				column: nw.column
-			construct.stringify = (indent) -> "#{construct.typTree.stringify(indent)}.new" + strtyp(construct,indent)
-			construct.subtrees = () -> [construct.typTree]
-			stack.push construct
-			return true
+			if matches(["TYPE"])
+				_typTree = stack.pop()
+				construct =
+					type: "CONSTRUCT"
+					alttypes: ["TERM"]
+					typTree: _typTree
+					line: nw.line
+					column: nw.column
+				construct.stringify = (indent) -> "#{construct.typTree.stringify(indent)}.new"
+				construct.subtrees = () -> [construct.typTree]
+				stack.push construct
+				return true
+			else
+				throw new Error("Expected type in object construction on line #{nw.line} character #{nw.column}, got #{fromTopOfStack(0).stringify(0)}")
 
 		if matches(["STATEMENTS", "NEWLINE"])
 			stack.pop()  # get rid of redundant newline
