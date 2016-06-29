@@ -29,7 +29,7 @@
         printSymbolTables(ast);
       }
       outputBuffer = [];
-      genConstructor(ast, 0, outputBuffer);
+      genConstructor(ast, predefCtx, 0, outputBuffer);
       outputBuffer.push(";");
       output = outputBuffer.join("");
       logText = channels[stderr] ? "/** Stderr log:\n\n" + channels[stderr].join("\n") + "\n**/" : "";
@@ -38,7 +38,7 @@
       error = error1;
       message = error.message != null ? error.message : error;
       message = message.toUpperCase().startsWith("ERROR") || message.toUpperCase().startsWith("INTERNAL COMPILER ERROR") ? message : "Error: " + message;
-      stacktrace = error.stack != null ? error.stack : "";
+      stacktrace = error.stack != null ? "COMPILER STACKTRACE:\n" + error.stack : "";
       logText = channels[stderr] ? "Stderr log:\n\n" + channels[stderr].join("\n") : "";
       return [message, logText, stacktrace].join("\n\n");
     }
@@ -479,37 +479,12 @@
     ctx.findMember = function(name) {
       return findMember(name, typTree, ctx.outer);
     };
-
-    /*
-    	ctx.addSymbol = (name, typTree) ->
-    		if ctx.members[name]
-    			throw "Error : Duplicate definition of '#{name}' at line #{typTree.line} character #{typTree.column}"
-    		log(stderr, "(Symbols) Registering name #{name} in context #{ctx.name}")
-    		record = if ctx.members[name] then ctx.members[name] else
-    			name: name
-    			typTree: typTree
-    		ctx.members[name] = record
-    
-    	ctx.ensureMembersDefined = () ->
-    		if not ctx.members?
-    			ctx.members = {}
-    			typTree.regMembers()
-    		ctx.members
-    
-    	ctx.info = () ->  # represents the membership of this context as a type. TODO: do we need this?
-    		ctx.ensureMembersDefined()
-    		#typTree = Any
-    		#for name, typ of ctx.members
-    		 *	typTree = AndType(typTree, )
-     */
     return ctx;
   };
 
   findMember = function(name, typTree, ctx) {
     var found, j, len, lhsType, ref, rhsType, st, widenedIdTree, widenedTyp;
-    if (typTree.type === "CONSTRUCT") {
-      return findMember(name, typTree.typTree, typTree.typTree.ctx);
-    } else if (typTree.type === "STATEMENTS") {
+    if (typTree.type === "STATEMENTS") {
       found = void 0;
       ref = typTree.statements;
       for (j = 0, len = ref.length; j < len; j++) {
@@ -528,13 +503,11 @@
       }
       return found;
     } else if (typTree.type === "ID") {
-      widenedIdTree = widen(typTree, ctx.outer);
+      widenedIdTree = widen(typTree, ctx);
       return findMember(name, widenedIdTree, widenedIdTree.ctx);
     } else if (typTree.type === "TYPE-SELECT") {
-      widenedTyp = widen(typTree, ctx.outer);
+      widenedTyp = widen(typTree, ctx);
       return findMember(name, widenedTyp, widenedTyp.ctx);
-    } else if (typTree.type === "TYPE-BOUNDS") {
-
     } else if (typTree.type === "AND-TYPE") {
       lhsType = findMember(name, typTree.lhs, ctx);
       rhsType = findMember(name, typTree.rhs, ctx);
@@ -545,6 +518,8 @@
       } else {
         return AndType(lhsType, rhsType);
       }
+    } else {
+      throw new Error("Internal compiler error: Unexpected " + typTree.type + " tree in findMember");
     }
   };
 
@@ -560,6 +535,10 @@
     } else if (tree.type === "TYPE-SELECT") {
       prefixTyp = widen(tree.prefix, ctx);
       return requireMemberInType(tree.ID, prefixTyp, tree);
+    } else if (tree.type === "CONSTRUCT") {
+      return tree.typTree;
+    } else {
+      throw new Error("Unexpected " + tree.type + " tree in widen");
     }
   };
 
@@ -600,7 +579,7 @@
 
   requireMemberInType = function(name, typTree, sourceTree) {
     var found;
-    found = findMember(name, typTree);
+    found = findMember(name, typTree, typTree.ctx);
     if (!found) {
       throw new Error("Member '" + name + "' at line " + sourceTree.line + " character " + sourceTree.column + " could not be found");
     }
@@ -649,7 +628,7 @@
       results = [];
       for (j = 0, len = ref.length; j < len; j++) {
         st = ref[j];
-        results.push(doStatementCompleters(st, ctx));
+        results.push(doStatementCompleters(st, tree.ctx));
       }
       return results;
     } else if (tree.type === "ID") {
@@ -675,7 +654,7 @@
       };
       return doTermCompleters(tree.prefix, ctx);
     } else if (tree.type === "CONSTRUCT") {
-      ctx = ctx.fresh(tree);
+      ctx = ctx.fresh(tree.typTree);
       tree.info = function() {
         return tree.typTree;
       };
@@ -703,7 +682,7 @@
   };
 
   gen = function(tree, ctx, indent, output) {
-    var defCtx, j, k, len, len1, lhsType, ref, ref1, ref2, results, rhsType, st;
+    var defCtx, j, k, len, len1, lhsType, prefixType, ref, ref1, ref2, results, rhsType, st;
     if (tree.type === "STATEMENTS") {
       ref = tree.statements;
       for (j = 0, len = ref.length; j < len; j++) {
@@ -739,11 +718,13 @@
       }
       return results;
     } else if (tree.type === "CONSTRUCT") {
-      return genConstructor(tree.typTree, indent, output);
+      return genConstructor(tree.typTree, ctx, indent, output);
     } else if (tree.type === "id") {
       defCtx = requireDefContext(tree.match, ctx, tree);
       return output.push(defCtx.name + "." + tree.match);
     } else if (tree.type === "TERM-SELECT") {
+      prefixType = widen(tree.prefix, ctx);
+      requireMemberInType(tree.id, prefixType, tree);
       gen(tree.prefix, ctx, indent, output);
       output.push(".");
       return output.push(tree.id);
@@ -753,7 +734,7 @@
   genInitializer = function(tree, indent, output) {
     var base, bases, ctx, j, len;
     ctx = tree.ctx;
-    output.push("function(" + tree.ctx.name + "){\n");
+    output.push("function(" + ctx.name + "){\n");
     bases = getBaseTypes(tree);
     for (j = 0, len = bases.length; j < len; j++) {
       base = bases[j];
@@ -761,29 +742,39 @@
         gen(base, ctx, indent + 1, output);
       }
     }
+    output.push(tabs(indent + 1));
+    output.push("return " + ctx.name + ";\n");
     output.push(tabs(indent));
     return output.push("}");
   };
 
-  genConstructor = function(tree, indent, output) {
+  genConstructor = function(tree, outer, indent, output) {
     var base, bases, ctx, defCtx, j, len;
     ctx = tree.ctx;
-    output.push("(function(" + tree.ctx.name + "){\n");
+    output.push("(function(" + ctx.name + "){\n");
     bases = getBaseTypes(tree);
     for (j = 0, len = bases.length; j < len; j++) {
       base = bases[j];
       if (base.type === "STATEMENTS") {
         gen(base, ctx, indent + 1, output);
       } else if (base.type === "ID") {
-        defCtx = requireDefContext(base.match, ctx.outer, base);
+        defCtx = requireDefContext(base.match, outer, base);
         output.push(tabs(indent + 1));
         output.push(defCtx.name + "." + base.match + "(" + ctx.name + ");\n");
       } else if (base.type === "TYPE-SELECT") {
         output.push(tabs(indent + 1));
-        gen(base.prefix, ctx.outer, indent + 1, output);
+        gen(base.prefix, outer, indent + 1, output);
         output.push("." + base.ID + "(" + ctx.name + ");\n");
+      } else if (base.type === "ANY") {
+
+      } else if (base.type === "NOTHING") {
+        throw new Error("Cannot construct an object with a base class of Nothing. Constructor at line " + tree.line + " character " + tree.column);
+      } else {
+        throw new Error("Internal compiler error: Unexpected base type tree " + base.type + " in genConstructor. Line " + tree.line + " character " + tree.column);
       }
     }
+    output.push(tabs(indent + 1));
+    output.push("return " + ctx.name + ";\n");
     output.push(tabs(indent));
     return output.push("})({})");
   };

@@ -20,7 +20,7 @@ window.compile = (input, stopAfter) ->
 			printSymbolTables(ast)
 
 		outputBuffer = []
-		genConstructor(ast, 0, outputBuffer)
+		genConstructor(ast, predefCtx, 0, outputBuffer)
 		outputBuffer.push(";")
 		output = outputBuffer.join("")
 
@@ -31,7 +31,7 @@ window.compile = (input, stopAfter) ->
 	catch error
 		message = if error.message? then error.message else error
 		message = if message.toUpperCase().startsWith("ERROR") or message.toUpperCase().startsWith("INTERNAL COMPILER ERROR") then message else "Error: " + message
-		stacktrace = if error.stack? then error.stack else ""
+		stacktrace = if error.stack? then "COMPILER STACKTRACE:\n" + error.stack else ""
 		logText = if channels[stderr] then "Stderr log:\n\n" + channels[stderr].join("\n") else ""
 		return [message, logText, stacktrace].join("\n\n")
 
@@ -458,37 +458,11 @@ freshContext = (outer, typTree) ->
 	ctx.findMember = (name) ->
 		findMember(name, typTree, ctx.outer)
 
-	###
-	ctx.addSymbol = (name, typTree) ->
-		if ctx.members[name]
-			throw "Error : Duplicate definition of '#{name}' at line #{typTree.line} character #{typTree.column}"
-		log(stderr, "(Symbols) Registering name #{name} in context #{ctx.name}")
-		record = if ctx.members[name] then ctx.members[name] else
-			name: name
-			typTree: typTree
-		ctx.members[name] = record
-
-	ctx.ensureMembersDefined = () ->
-		if not ctx.members?
-			ctx.members = {}
-			typTree.regMembers()
-		ctx.members
-
-	ctx.info = () ->  # represents the membership of this context as a type. TODO: do we need this?
-		ctx.ensureMembersDefined()
-		#typTree = Any
-		#for name, typ of ctx.members
-		#	typTree = AndType(typTree, )
-	###
-
 	ctx
 
 findMember = (name, typTree, ctx) ->  # params: name to find, type tree to look into, enclosing context to resolve type/term names in the type tree
 
-	if typTree.type is "CONSTRUCT"
-		findMember(name, typTree.typTree, typTree.typTree.ctx)
-
-	else if typTree.type is "STATEMENTS"
+	if typTree.type is "STATEMENTS"
 		found = undefined
 		for st in typTree.statements
 			if st.type is "TYPE-DECL" and st.lhs.match is name
@@ -500,14 +474,14 @@ findMember = (name, typTree, ctx) ->  # params: name to find, type tree to look 
 		found
 
 	else if typTree.type is "ID"
-		widenedIdTree = widen(typTree, ctx.outer)
+		#widenedIdTree = widen(typTree, ctx.outer)
+		widenedIdTree = widen(typTree, ctx)
 		findMember(name, widenedIdTree, widenedIdTree.ctx)
 
 	else if typTree.type is "TYPE-SELECT"
-		widenedTyp = widen(typTree, ctx.outer)
+		#widenedTyp = widen(typTree, ctx.outer)
+		widenedTyp = widen(typTree, ctx)
 		findMember(name, widenedTyp, widenedTyp.ctx)
-
-	else if typTree.type is "TYPE-BOUNDS"
 
 	else if typTree.type is "AND-TYPE"
 		lhsType = findMember(name, typTree.lhs, ctx)
@@ -518,6 +492,9 @@ findMember = (name, typTree, ctx) ->  # params: name to find, type tree to look 
 			lhsType
 		else
 			AndType(lhsType, rhsType)
+
+	else
+		throw new Error("Internal compiler error: Unexpected #{typTree.type} tree in findMember")
 
 widen = (tree, ctx) ->
 	if tree.type is "id"
@@ -530,6 +507,10 @@ widen = (tree, ctx) ->
 	else if tree.type is "TYPE-SELECT"
 		prefixTyp = widen(tree.prefix, ctx)
 		requireMemberInType(tree.ID, prefixTyp, tree)
+	else if tree.type is "CONSTRUCT"
+		tree.typTree
+	else
+		throw new Error("Unexpected #{tree.type} tree in widen")
 
 findMemberInContext = (name, ctx) ->
 	if not ctx
@@ -559,7 +540,7 @@ requireMemberInContext = (name, ctx, sourceTree) ->
 	typTree
 
 requireMemberInType = (name, typTree, sourceTree) ->
-	found = findMember(name, typTree)
+	found = findMember(name, typTree, typTree.ctx)
 	if not found
 		throw new Error("Member '#{name}' at line #{sourceTree.line} character #{sourceTree.column} could not be found")
 	found
@@ -608,7 +589,7 @@ doTypeCompleters = (tree, ctx) ->
 
 	if tree.type is "STATEMENTS"
 		for st in tree.statements
-			doStatementCompleters(st, ctx)
+			doStatementCompleters(st, tree.ctx)
 
 	else if tree.type is "ID"
 		# TODO?
@@ -636,7 +617,7 @@ doTermCompleters = (tree, ctx) ->
 		doTermCompleters(tree.prefix, ctx)
 
 	else if tree.type is "CONSTRUCT"
-		ctx = ctx.fresh(tree)
+		ctx = ctx.fresh(tree.typTree)
 		# Note on info() functions: The invariant of info() is that it always returns a type tree (not a statement or a term).
 		# There are at least two variants on info(): return the type tree as-is, or return a STATEMENTS tree containing linearized declarations.
 		#  (We do the former here.)
@@ -696,20 +677,22 @@ gen = (tree, ctx, indent, output) ->
 				output.push(";\n")
 
 	else if tree.type is "CONSTRUCT"
-		genConstructor(tree.typTree, indent, output)
+		genConstructor(tree.typTree, ctx, indent, output)
 
 	else if tree.type is "id"
 		defCtx = requireDefContext(tree.match, ctx, tree)
 		output.push("#{defCtx.name}.#{tree.match}")
 
 	else if tree.type is "TERM-SELECT"
+		prefixType = widen(tree.prefix, ctx)
+		requireMemberInType(tree.id, prefixType, tree)  # Typecheck: make sure id exists in prefix type
 		gen(tree.prefix, ctx, indent, output)
 		output.push(".")
 		output.push(tree.id)
 
 genInitializer = (tree, indent, output) ->
 	ctx = tree.ctx
-	output.push("function(#{tree.ctx.name}){\n")
+	output.push("function(#{ctx.name}){\n")
 	bases = getBaseTypes(tree)   # TODO remove duplicates?
 
 	# Here, generate statements only. Calls to other initializers should really be hoisted into constructors
@@ -717,26 +700,36 @@ genInitializer = (tree, indent, output) ->
 		if base.type is "STATEMENTS"
 			gen(base, ctx, indent + 1, output)
 
+	output.push(tabs(indent + 1))
+	output.push("return #{ctx.name};\n")
 	output.push(tabs(indent))
 	output.push("}")
 
-genConstructor = (tree, indent, output) ->
+genConstructor = (tree, outer, indent, output) ->
 	ctx = tree.ctx
-	output.push("(function(#{tree.ctx.name}){\n")
+	output.push("(function(#{ctx.name}){\n")
 	bases = getBaseTypes(tree)   # TODO remove duplicates?
 
 	for base in bases
 		if base.type is "STATEMENTS"
 			gen(base, ctx, indent + 1, output)
 		else if base.type is "ID"
-			defCtx = requireDefContext(base.match, ctx.outer, base)
+			defCtx = requireDefContext(base.match, outer, base)
 			output.push(tabs(indent + 1))
 			output.push("#{defCtx.name}.#{base.match}(#{ctx.name});\n")
 		else if base.type is "TYPE-SELECT"
 			output.push(tabs(indent + 1))
-			gen(base.prefix, ctx.outer, indent + 1, output)
+			gen(base.prefix, outer, indent + 1, output)
 			output.push(".#{base.ID}(#{ctx.name});\n")
+		else if base.type is "ANY"
+			# don't need to do anything with Any
+		else if base.type is "NOTHING"
+			throw new Error("Cannot construct an object with a base class of Nothing. Constructor at line #{tree.line} character #{tree.column}")
+		else
+			throw new Error("Internal compiler error: Unexpected base type tree #{base.type} in genConstructor. Line #{tree.line} character #{tree.column}")
 
+	output.push(tabs(indent + 1))
+	output.push("return #{ctx.name};\n")
 	output.push(tabs(indent))
 	output.push("})({})")
 
