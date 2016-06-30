@@ -1704,6 +1704,27 @@
         stack.push(t);
         return true;
       }
+      if (matches(["TYPE", "OR", "TYPE"])) {
+        rhs = stack.pop();
+        stack.pop();
+        lhs = stack.pop();
+        t = {
+          type: "OR-TYPE",
+          alttypes: ["TYPE"],
+          lhs: lhs,
+          rhs: rhs,
+          line: lhs.line,
+          column: lhs.column
+        };
+        t.stringify = function(indent) {
+          return t.lhs.stringify(indent) + " | " + t.rhs.stringify(indent);
+        };
+        t.subtrees = function() {
+          return [t.lhs, t.rhs];
+        };
+        stack.push(t);
+        return true;
+      }
       if (matches(["STATEMENTS", "*", "NEWLINE"])) {
         stack.pop();
         if (matches(["TERM"])) {
