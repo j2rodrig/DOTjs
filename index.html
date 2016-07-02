@@ -70,13 +70,12 @@
 				<p><i>id</i> ::= a term identifier (begins with a lower-case letter)<br>
 					<i>ID</i> ::= a type identifier (begins with an upper-case letter)</p>
 				<p><i>statement</i> ::= <br>
-					&emsp; <i>ID</i> ':' <i>type</i><br>
-					&emsp; <i>ID</i> ':' 'at least' <i>type</i> [ 'at most' <i>type</i> ]<br>
+					&emsp; <i>ID</i> ':' [ 'at least' ] <i>type</i> [ 'at most' <i>type</i> ]<br>
 					&emsp; <i>id</i> ':' <i>type</i><br>
 					&emsp; [ 'if' <i>term</i> 'then' ] [ [ <i>term</i> '.' ] <i>id</i> '=' ] <i>term</i><br>
 				</p>
 				<p><i>type</i> ::= <br>
-					&emsp; '{' ( <i>statement</i> NEWLINE )* ] '}'<br>
+					&emsp; '{' ( <i>statement</i> NEWLINE )* '}'<br>
 					&emsp; [ <i>term</i> '.' ] <i>ID</i><br>
 					&emsp; <i>type</i> '&amp;' <i>type</i><br>
 					&emsp; <i>type</i> '|' <i>type</i><br>
