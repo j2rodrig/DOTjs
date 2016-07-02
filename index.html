@@ -3,6 +3,7 @@
 <head>
 
 	<script src="compiler.js"></script>
+	<script src="examples.js"></script>
 
 	<style type="text/css">
 	textarea {
@@ -72,10 +73,10 @@
 					&emsp; <i>ID</i> ':' <i>type</i><br>
 					&emsp; <i>ID</i> ':' 'at least' <i>type</i> [ 'at most' <i>type</i> ]<br>
 					&emsp; <i>id</i> ':' <i>type</i><br>
-					&emsp; [ 'if' <i>term</i> 'then' ] [ [ <i>term</i> '.' <i>id</i> ] '=' ] <i>term</i><br>
+					&emsp; [ 'if' <i>term</i> 'then' ] [ [ <i>term</i> '.' ] <i>id</i> '=' ] <i>term</i><br>
 				</p>
 				<p><i>type</i> ::= <br>
-					&emsp; '{' [ <i>statement</i> ( NEWLINE <i>statement</i> )* ] '}'<br>
+					&emsp; '{' ( <i>statement</i> NEWLINE )* ] '}'<br>
 					&emsp; [ <i>term</i> '.' ] <i>ID</i><br>
 					&emsp; <i>type</i> '&amp;' <i>type</i><br>
 					&emsp; <i>type</i> '|' <i>type</i><br>
@@ -96,10 +97,30 @@
 	<div style="display: inline-block; vertical-align:top; width:49%">
 		<textarea id="textarea-input" rows=20 style="width:95%;resize:vertical;" autofocus></textarea>
 
-		<h3 style="display:inline-block;width:46%">&nbsp;</h3> <!-- for spacing -->
-		<div style="display:inline-block;width:46%;text-align:right">
-			<button style="font-size:1em"
-				onclick="document.getElementById('textarea-output').value = compile(document.getElementById('textarea-input').value, 'types')">Compile</button>
+		<div>
+			<table style="float:right;">
+				<tr>
+					<td>
+						<select style="font-size:1em" onchange="showExample(this.value, document.getElementById('textarea-input'))">
+							<option value="">Examples</option>
+							<option value="Method Type Invocation">Method Type Invocation</option>
+							<option value="WIP-1">WIP-1</option>
+						</select>
+					</td>
+					<td>
+						&ensp;
+					</td>
+					<td>
+						<button style="font-size:1em"
+							onclick="document.getElementById('textarea-output').value = compile(document.getElementById('textarea-input').value, 'types')">
+								Compile
+						</button>
+					</td>
+					<td>
+						&ensp;
+					</td>
+				</tr>
+			</table>
 		</div>
 	</div>
 
