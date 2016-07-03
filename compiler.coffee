@@ -386,6 +386,10 @@ June 24.
 		H: at most L   // OK. The mixin context surrounding L here is evaluated lazily, so all members of L are established before we get here.
 	}
 
+July 2.
+
+	The problem of symbol lookup seems to be solved. Up next: Type comparison.
+
 ###
 
 Any =
@@ -394,7 +398,7 @@ Any =
 	column: "(built-in)"
 
 Nothing =
-    type: "NOTHING"
+	type: "NOTHING"
 	line: "(built-in)"
 	column: "(built-in)"
 
@@ -415,18 +419,83 @@ OrType = (lhsTyp, rhsTyp) ->
 	type: "OR-TYPE"
 	lhs: lhsTyp
 	rhs: rhsTyp
-    alttypes: undefined
 	line: "(built-in)"
 	column: "(built-in)"
 
 TypeBounds = (typLower, typUpper) ->
 	type: "TYPE-BOUNDS"
-	alttypes: undefined
 	lower: typLower
 	upper: typUpper
 
 
-### CONTEXTS AND SYMBOLS ###
+### TYPE OPERATIONS ###
+
+derivedTypeBounds = (tree, lower, upper) ->
+	if lower is tree.lower and upper is tree.upper
+		tree
+	else
+		TypeBounds(lower, upper)
+
+derivedAndOrType = (tree, lhs, rhs) ->
+	if lhs is tree.lhs and rhs is tree.rhs
+		tree
+	else if tree.type is "AND-TYPE"
+		AndType(lhs, rhs)
+	else if tree.type is "OR-TYPE"
+		OrType(lhs, rhs)
+
+lowerBound = (tree) ->
+	if tree.type is "TYPE-BOUNDS"
+		tree.lower
+	else
+		tree
+
+upperBound = (tree) ->
+	if tree.type is "TYPE-BOUNDS"
+		tree.upper
+	else
+		tree
+
+simplifyType = (tree) ->
+
+	if tree.type is "TYPE-BOUNDS"
+		tree2 = derivedTypeBounds(tree, simplifyType(tree.lower), simplifyType(tree.upper))
+		if tree2.lower is tree2.upper   # if bounds are equivalent, then just return one of them
+			tree2.lower
+		else
+			tree2
+
+	else if tree.type is "AND-TYPE"
+		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
+		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
+			tree2.lhs
+		else if tree2.lhs is Nothing or tree2.rhs is Nothing   # intersection with Nothing === Nothing
+			Nothing
+		else if tree2.lhs is Any   # intersection with Any is redundant
+			tree2.rhs
+		else if tree2.rhs is Any
+			tree2.lhs
+		else
+			tree2
+
+	else if tree.type is "OR-TYPE"
+		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
+		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
+			tree2.lhs
+		else if tree2.lhs is Any or tree2.rhs is Any   # union with Any === Any
+			Any
+		else if tree2.lhs is Nothing   # union with Nothing is redundant
+			tree2.rhs
+		else if tree2.rhs is Nothing
+			tree2.lhs
+		else
+			tree2
+
+	else
+		tree
+
+
+### CONTEXTS AND SYMBOL LOOKUP ###
 
 createPredefContext = () ->
 	predefTree =
@@ -576,6 +645,8 @@ requireDefContext = (name, ctx, sourceTree) ->
 	found
 
 
+### BASE/CONSTRUCTOR TYPE QUERIES ###
+
 typeAsConstructed = (typTree, ctx) ->
 
 	# We return the intersection base types here (instead of the original type tree).
@@ -639,6 +710,10 @@ getBaseTypes = (typTree) ->
 		[typTree]
 	else
 		throw new Error("Internal compiler error: Expected a type tree in getBaseTypes, got #{typTree.type} tree")
+
+
+
+### LAZY INFO FUNCTIONS ... TODO: Do we really need these? ###
 
 doTypeCompleters = (tree, ctx) ->
 
@@ -709,9 +784,11 @@ doStatementCompleters = (tree, ctx) ->
 
 gen = (tree, ctx, indent, output) ->
 
+	# On statement ordering
+
 	if tree.type is "STATEMENTS"
 		for st in tree.statements
-			if st.type is "TYPE-DECL"   # TODO: we should really be hoisting these out of statement blocks and into their enclosing constructors
+			if st.type is "TYPE-DECL"
 				output.push(tabs(indent))
 				defCtx = requireDefContext(st.lhs.match, ctx, tree)
 				output.push("#{defCtx.name}.#{st.lhs.match}")
@@ -725,14 +802,29 @@ gen = (tree, ctx, indent, output) ->
 				rhsType = st.rhs.info()
 				# TODO: check for rhs <: lhs compatibility
 				output.push(tabs(indent))
+				if st.guard
+					output.push("if(")
+					gen(st.guard.condition, ctx, indent, output)
+					output.push("){ ")
 				gen(st.lhs, ctx, indent, output)
 				output.push(" = ")
 				gen(st.rhs, ctx, indent, output)
+				if st.guard
+					output.push(" }")
 				output.push(";\n")
 			else if st.type in ["id", "TERM-SELECT", "CONSTRUCT"]
 				output.push(tabs(indent))
+				if st.guard
+					output.push("if(")
+					gen(st.guard.condition, ctx, indent, output)
+					output.push("){ ")
 				gen(st, ctx, indent, output)
+				if st.guard
+					output.push(" }")
 				output.push(";\n")
+			else
+				if st.guard
+					throw new Error("Unexpected guard on #{st.type} statement on line #{st.guard.line}")
 
 	else if tree.type is "CONSTRUCT"
 		genConstructor(tree.typTree, ctx, indent, output)
@@ -795,81 +887,6 @@ genConstructor = (tree, outer, indent, output) ->
 	output.push("})({})")
 
 
-
-
-
-
-
-
-### TYPE OPERATIONS ###
-
-derivedTypeBounds = (tree, lower, upper) ->
-	if lower is tree.lower and upper is tree.upper
-		tree
-	else
-		TypeBounds(lower, upper)
-
-derivedAndOrType = (tree, lhs, rhs) ->
-	if lhs is tree.lhs and rhs is tree.rhs
-		tree
-	else if tree.type is "AND-TYPE"
-		AndType(lhs, rhs)
-	else if tree.type is "OR-TYPE"
-		OrType(lhs, rhs)
-
-lowerBound = (tree) ->
-	if tree.type is "TYPE-BOUNDS"
-		tree.lower
-	else
-		tree
-
-upperBound = (tree) ->
-	if tree.type is "TYPE-BOUNDS"
-		tree.upper
-	else
-		tree
-
-simplifyType = (tree) ->
-
-	if tree.type is "TYPE-BOUNDS"
-		tree2 = derivedTypeBounds(tree, simplifyType(tree.lower), simplifyType(tree.upper))
-		if tree2.lower is tree2.upper   # if bounds are equivalent, then just return one of them
-			tree2.lower
-		else
-			tree2
-
-	else if tree.type is "AND-TYPE"
-		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
-		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
-			tree2.lhs
-		else if tree2.lhs is Nothing or tree2.rhs is Nothing   # intersection with Nothing === Nothing
-			Nothing
-		else if tree2.lhs is Any   # intersection with Any is redundant
-			tree2.rhs
-		else if tree2.rhs is Any
-			tree2.lhs
-		else
-			tree2
-
-	else if tree.type is "OR-TYPE"
-		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
-		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
-			tree2.lhs
-		else if tree2.lhs is Any or tree2.rhs is Any   # union with Any === Any
-			Any
-		else if tree2.lhs is Nothing   # union with Nothing is redundant
-			tree2.rhs
-		else if tree2.rhs is Nothing
-			tree2.lhs
-		else
-			tree2
-
-	else
-		tree
-
-
-
-
 ### PARSER ###
 
 Token = (tokType, text, line, column) ->
@@ -909,6 +926,14 @@ TermDecl = (lhs, rhs) ->
 	t.stringify = (indent) -> t.lhs.stringify(indent) + ": " + t.rhs.stringify(indent)
 	t.subtrees = () -> [t.lhs, t.rhs]
 	t
+
+WithGuard = (guard, statement) ->
+	statement.guard = guard
+	prevStringify = statement.stringify
+	statement.stringify = (indent) -> guard.stringify(indent) + prevStringify(indent)
+	prevSubtrees = statement.subtrees
+	statement.subtrees = () -> [statement.guard].concat(prevSubtrees())
+	statement
 
 parse = (tokens) ->
 
@@ -986,6 +1011,14 @@ parse = (tokens) ->
 				fromTopOfStack(0).type = "NEW"
 				fromTopOfStack(0).alttypes = undefined
 				return true
+			if fromTopOfStack(0).match is "if"
+				fromTopOfStack(0).type = "IF"
+				fromTopOfStack(0).alttypes = undefined
+				return true
+			if fromTopOfStack(0).match is "then"
+				fromTopOfStack(0).type = "THEN"
+				fromTopOfStack(0).alttypes = undefined
+				return true
 			if fromTopOfStack(0).match is "outer"
 				fromTopOfStack(0).type = "OUTER"
 				fromTopOfStack(0).alttypes = undefined
@@ -1008,6 +1041,34 @@ parse = (tokens) ->
 				return true
 
 		### Selections ###
+
+		if matches(["IF", "TERM", "THEN"])
+			stack.pop()
+			condition = stack.pop()
+			stack.pop()
+			guard =
+				type: "GUARD"
+				condition: condition
+				line: condition.line
+				column: condition.column
+			guard.stringify = (indent) -> "if #{guard.condition.stringify(indent)} then "
+			guard.subtrees = () -> [guard.condition]
+			stack.push guard
+			return true
+
+		if matches(["GUARD", "STATEMENT"])
+			statement = stack.pop()
+			guard = stack.pop()
+			stack.push WithGuard(guard, statement)
+			return true
+
+		if matches(["GUARD", "*", "NEWLINE"])
+			nl = stack.pop()
+			term = stack.pop()
+			guard = stack.pop()
+			stack.push WithGuard(guard, term)
+			stack.push nl
+			return true
 
 		if matches(["TERM", "DOT", "id"])
 			id = stack.pop()

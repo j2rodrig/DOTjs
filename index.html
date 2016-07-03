@@ -19,6 +19,22 @@
 	</style>
 
 	<script>
+	function run(js) {
+		var message = "";
+		try {
+			eval(js);
+			message = "Run completed successfully.";
+		} catch(error) {
+			if (error.stack != null)
+				message = error.stack;
+			else if (error.message)
+				message = error.message;
+		}
+		return "/*\n" + message + "\n*/\n\n" + js;
+	}
+	</script>
+
+	<script>
 	/// Toggles the visibility of a DOM element.
 	function toggle(id) {
 		var elem = document.getElementById(id);
@@ -70,7 +86,8 @@
 				<p><i>id</i> ::= a term identifier (begins with a lower-case letter)<br>
 					<i>ID</i> ::= a type identifier (begins with an upper-case letter)</p>
 				<p><i>statement</i> ::= <br>
-					&emsp; <i>ID</i> ':' [ 'at least' ] <i>type</i> [ 'at most' <i>type</i> ]<br>
+					&emsp; <i>ID</i> ':' 'at least' <i>type</i> [ 'at most' <i>type</i> ]<br>
+					&emsp; <i>ID</i> ':' <i>type</i><br>
 					&emsp; <i>id</i> ':' <i>type</i><br>
 					&emsp; [ 'if' <i>term</i> 'then' ] [ [ <i>term</i> '.' ] <i>id</i> '=' ] <i>term</i><br>
 				</p>
@@ -111,7 +128,7 @@
 					</td>
 					<td>
 						<button style="font-size:1em"
-							onclick="document.getElementById('textarea-output').value = compile(document.getElementById('textarea-input').value, 'types')">
+							onclick="document.getElementById('textarea-output').value = compile(document.getElementById('textarea-input').value)">
 								Compile
 						</button>
 					</td>
@@ -125,6 +142,22 @@
 
 	<div style="display: inline-block; vertical-align:top; width:49%">
 		<textarea id="textarea-output" readonly=true rows=20 style="width:95%;resize:vertical"></textarea>
+
+		<div>
+			<table style="float:right;">
+				<tr>
+					<td>
+						<button style="font-size:1em"
+							onclick="document.getElementById('textarea-output').value = run(document.getElementById('textarea-output').value)">
+								Run
+						</button>
+					</td>
+					<td>
+						&ensp;
+					</td>
+				</tr>
+			</table>
+		</div>
 	</div>
 
 </body>
