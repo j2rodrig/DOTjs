@@ -24,21 +24,26 @@ window.compile = (input, stopAfter) ->
 		outputBuffer.push(";")
 		output = outputBuffer.join("")
 
-		logText = if channels[stderr] then "/** Stderr log:\n\n" + channels[stderr].join("\n") + "\n**/" else ""
+		allOutput = [output]
+		if channels[types] then allOutput.push("/** Types log:\n\n" + channels[types].join("\n") + "\n**/")
+		if channels[stderr] then allOutput.push("/** Stderr log:\n\n" + channels[stderr].join("\n") + "\n**/")
 
-		return [output, logText].join("\n\n")
+		return allOutput.join("\n\n")
 
 	catch error
 		message = if error.message? then error.message else error
 		message = if message.toUpperCase().startsWith("ERROR") or message.toUpperCase().startsWith("INTERNAL COMPILER ERROR") then message else "Error: " + message
-		stacktrace = if error.stack? then "COMPILER STACKTRACE:\n" + error.stack else ""
-		logText = if channels[stderr] then "Stderr log:\n\n" + channels[stderr].join("\n") else ""
-		return [message, logText, stacktrace].join("\n\n")
+		output = [message]
+		if channels[types] then output.push("Types log:\n\n" + channels[types].join("\n"))
+		if channels[stderr] then output.push("Stderr log:\n\n" + channels[stderr].join("\n"))
+		if error.stack? then output.push("COMPILER STACKTRACE:\n" + error.stack)
+		return output.join("\n\n")
 
 
 channels = {}
 
 stderr = "stderr"
+types = "types"
 
 clearLog = () ->
 	channels = {}
@@ -390,42 +395,41 @@ July 2.
 
 	The problem of symbol lookup seems to be solved. Up next: Type comparison.
 
+July 4.
+
+	There is a problem with type lookup:
+		Which context do we start with when looking into a type?
+		If we use the original context, that works, but the result is conservative, so we don't get all the benefits of path-dependent typing.
+		Specifically, we don't get type polymorphism.
+	Instead, we need to look up type IDs from the current context (rather than the original context).
+
 ###
 
 Any =
 	type: "ANY"
-	line: "(built-in)"
-	column: "(built-in)"
+	stringify: (indent) -> "Any"
 
 Nothing =
 	type: "NOTHING"
-	line: "(built-in)"
-	column: "(built-in)"
-
-TakeLowerBound = (underlying) ->
-	type: "TAKE-LOWER-BOUND"
-	underlying: underlying
-	line: "(built-in)"
-	column: "(built-in)"
+	stringify: (indent) -> "Nothing"
 
 AndType = (lhsTyp, rhsTyp) ->
 	type: "AND-TYPE"
 	lhs: lhsTyp
 	rhs: rhsTyp
-	line: "(built-in)"
-	column: "(built-in)"
+	stringify: (indent) -> lhsTyp.stringify(indent) + " & " + rhsTyp.stringify(indent)
 
 OrType = (lhsTyp, rhsTyp) ->
 	type: "OR-TYPE"
 	lhs: lhsTyp
 	rhs: rhsTyp
-	line: "(built-in)"
-	column: "(built-in)"
+	stringify: (indent) -> lhsTyp.stringify(indent) + " & " + rhsTyp.stringify(indent)
 
 TypeBounds = (typLower, typUpper) ->
 	type: "TYPE-BOUNDS"
 	lower: typLower
 	upper: typUpper
+	stringify: (indent) -> "at least #{typLower.stringify(indent)} at most #{typUpper.stringify(indent)}"
 
 
 ### TYPE OPERATIONS ###
@@ -495,7 +499,7 @@ simplifyType = (tree) ->
 		tree
 
 
-### CONTEXTS AND SYMBOL LOOKUP ###
+### CONTEXTS AND SYMBOL/MEMBER LOOKUP ###
 
 createPredefContext = () ->
 	predefTree =
@@ -534,15 +538,16 @@ freshContext = (outer, typTree) ->
 
 	ctx.fresh = (typTree) -> freshContext(ctx, typTree)
 
-	# Notes on findMember:
-	#  Always search on the lower bound of the context's tree. The lower bound contains the members that are actually included during construction.
-	ctx.findMember = (name) ->
+	ctx.findMember = (name, returnLowerBound, logIndent) ->
+		# Find the actual statement blocks that define the members of this context.
 		asConstructed = typeAsConstructed(typTree, ctx.outer)
-		findMember(name, asConstructed, ctx.outer, true)
+		# Unlike the above, the context for the call to findMember is undefined.
+		# Since the asConstructed tree no longer includes names of base types, the context is never referenced, so we don't pass one.
+		findMember(name, asConstructed, undefined, returnLowerBound, logIndent)
 
 	ctx
 
-findMember = (name, typTree, ctx, returnLowerBound) ->  # params: name to find, type tree to look into, enclosing context to resolve type/term names in the type tree
+findMember = (name, typTree, ctx, returnLowerBound, logIndent) ->  # params: name to find, type tree to look into, enclosing context to resolve type/term names in the type tree
 
 	if typTree.type is "STATEMENTS"
 		found = undefined
@@ -569,12 +574,12 @@ findMember = (name, typTree, ctx, returnLowerBound) ->  # params: name to find, 
 		# a result for the mutability member, but not for other members.
 
 	else if typTree.type is "ID"
-		widenedIdTree = widen(typTree, ctx)
-		findMember(name, widenedIdTree, widenedIdTree.ctx, returnLowerBound)
+		[widenedIdCtx, widenedIdTree] = widen(typTree, ctx)
+		findMember(name, widenedIdTree, widenedIdCtx, returnLowerBound)
 
 	else if typTree.type is "TYPE-SELECT"
-		widenedTyp = widen(typTree, ctx)
-		findMember(name, widenedTyp, widenedTyp.ctx, returnLowerBound)
+		[widenedCtx, widenedTyp] = widen(typTree, ctx)
+		findMember(name, widenedTyp, widenedCtx, returnLowerBound)
 
 	else if typTree.type is "AND-TYPE"
 		lhsType = findMember(name, typTree.lhs, ctx, returnLowerBound)
@@ -589,31 +594,46 @@ findMember = (name, typTree, ctx, returnLowerBound) ->  # params: name to find, 
 	else
 		throw new Error("Internal compiler error: Unexpected #{typTree.type} tree in findMember")
 
-widen = (tree, ctx, returnLowerBound) ->
+# Widen a term or named type to its corresponding type tree.
+# For named types or terms, returns the given context.
+# For constructors, returns the context for that constructor itself.
+widen = (tree, ctx, returnLowerBound, logIndent = 0) ->
+
 	if tree.type is "id"
-		requireMemberInContext(tree.match, ctx, tree)
+		[ctx, requireMemberInContext(tree.match, ctx, tree, returnLowerBound, logIndent+1)]
+
 	else if tree.type is "ID"
-		requireMemberInContext(tree.match, ctx, tree, returnLowerBound)
+		log(types, tabs(logIndent) + "Widening ID #{tree.match} starting from context #{ctx.name}")
+		[ctx, requireMemberInContext(tree.match, ctx, tree, returnLowerBound, logIndent+1)]
+
 	else if tree.type is "TERM-SELECT"
-		prefixTyp = widen(tree.prefix, ctx)
-		requireMemberInType(tree.id, prefixTyp, tree)
+		log(types, tabs(logIndent) + "Widening term selection #{tree.stringify(logIndent+1)} starting from context #{ctx.name}")
+		[prefixCtx, prefixTyp] = widen(tree.prefix, ctx, false, logIndent+1)
+		[prefixCtx, requireMemberInType(tree.id, prefixTyp, prefixCtx, tree, returnLowerBound)]
+
 	else if tree.type is "TYPE-SELECT"
-		prefixTyp = widen(tree.prefix, ctx)
-		requireMemberInType(tree.ID, prefixTyp, tree, returnLowerBound)
+		log(types, tabs(logIndent) + "Widening type selection #{tree.stringify(logIndent+1)} starting from context #{ctx.name}")
+		[prefixCtx, prefixTyp] = widen(tree.prefix, ctx, false, logIndent+1)
+		[prefixCtx, requireMemberInType(tree.ID, prefixTyp, prefixCtx, tree, returnLowerBound)]
+
 	else if tree.type is "CONSTRUCT"
-		typeAsConstructed(tree.typTree, ctx)
+		asConstructed = typeAsConstructed(tree.typTree, ctx)
+		log(types, tabs(logIndent) + "Widening constructor #{asConstructed.stringify(logIndent+1)} starting from context #{ctx.name}")
+		[tree.typTree.ctx, asConstructed]  # context is context of self-type
+
 	else
 		throw new Error("Unexpected #{tree.type} tree in widen")
 
-findMemberInContext = (name, ctx) ->
+
+findMemberInContext = (name, ctx, returnLowerBound, logIndent) ->
 	if not ctx
 		undefined
 	else
-		found = ctx.findMember(name)
+		found = ctx.findMember(name, returnLowerBound, logIndent)
 		if found
 			found
 		else
-			findMemberInContext(name, ctx.outer)
+			findMemberInContext(name, ctx.outer, returnLowerBound, logIndent)
 
 # Finds the context that defines the given name, if it is in ctx or enclosing.
 getDefContext = (name, ctx) ->
@@ -626,14 +646,14 @@ getDefContext = (name, ctx) ->
 			getDefContext(name, ctx.outer)
 
 # Throws an error if the given name is not defined in the given or enclosing contexts.
-requireMemberInContext = (name, ctx, sourceTree) ->
-	typTree = findMemberInContext(name, ctx)
+requireMemberInContext = (name, ctx, sourceTree, returnLowerBound, logIndent) ->
+	typTree = findMemberInContext(name, ctx, returnLowerBound, logIndent)
 	if not typTree
 		throw new Error("Name '#{name}' is not defined at line #{sourceTree.line} character #{sourceTree.column}")
 	typTree
 
-requireMemberInType = (name, typTree, sourceTree, returnLowerBound) ->
-	found = findMember(name, typTree, typTree.ctx, returnLowerBound)
+requireMemberInType = (name, typTree, ctx, sourceTree, returnLowerBound, logIndent) ->
+	found = findMember(name, typTree, ctx, returnLowerBound, logIndent)
 	if not found
 		throw new Error("Member '#{name}' at line #{sourceTree.line} character #{sourceTree.column} could not be found")
 	found
@@ -668,10 +688,10 @@ findBaseStatementBlocks = (typTree, ctx) ->
 	for base in getBaseTypes(typTree)
 		if not (base in basesSeen)
 			basesSeen.push base
-			if base.type is "STATEMENTS"
+			if base.type in ["STATEMENTS", "ANY", "NOTHING"]
 				statementsFound.push base
 			else if base.type in ["ID", "TYPE-SELECT"]
-				widenedType = widen(base, ctx, true)
+				[ignore, widenedType] = widen(base, ctx, true)
 				for stmts in findBaseStatementBlocks(widenedType, widenedType.ctx.outer)
 					if not (stmts in basesSeen)
 						basesSeen.push stmts
@@ -706,7 +726,7 @@ getBaseTypes = (typTree) ->
 			if b is Nothing or b.match is "Nothing"
 				return rhsBases
 		lhsBases
-	else if typTree.type is "STATEMENTS"
+	else if typTree.type in ["STATEMENTS", "ANY", "NOTHING"]
 		[typTree]
 	else
 		throw new Error("Internal compiler error: Expected a type tree in getBaseTypes, got #{typTree.type} tree")
@@ -745,7 +765,7 @@ doTermCompleters = (tree, ctx) ->
 
 	else if tree.type is "TERM-SELECT"
 		tree.info = () ->
-			requireMemberInType(tree.id, tree.prefix.info(), tree)
+			requireMemberInType(tree.id, tree.prefix.info(), ctx, tree)
 		doTermCompleters(tree.prefix, ctx)
 
 	else if tree.type is "CONSTRUCT"
@@ -780,6 +800,37 @@ doStatementCompleters = (tree, ctx) ->
 		doTermCompleters(tree, ctx)  # assume anything else is a term
 
 
+### TYPE COMPARISONS ###
+
+isSubType = (t0, t1) ->
+
+	log(stderr, "\t#{t0.stringify(1)} <:? #{t1.stringify(1)}")
+
+	if t0 is t1
+		true
+	else if t0 is Nothing
+		true
+	else if t1 is Any
+		true
+
+	else if t1.type is "ID"
+		if t0.type is "ID" and t0.match is t1.match
+			t0ctx = requireDefContext(t0.match, t0.ctx, t0)
+			t1ctx = requireDefContext(t1.match, t1.ctx, t1)
+			if t0ctx is t1ctx  # same name in same context
+				return true
+		#isSubType(widen(t0, t0.ctx, false), widen(t1, t1.ctx, true))
+
+	else
+		false
+
+requireCompatibility = (t0, t1, whereTree) ->
+	if isSubType(t0, t1)
+		true
+	else
+		throw new Error("Type error: expected: #{t1.stringify(0)}\n\tGot: #{t0.stringify(0)}\n\tOn line #{whereTree.line} character #{whereTree.column}")
+
+
 ### CODEGEN ###
 
 gen = (tree, ctx, indent, output) ->
@@ -798,9 +849,8 @@ gen = (tree, ctx, indent, output) ->
 
 		for st in tree.statements
 			if st.type is "TERM-ASSIGN"
-				lhsType = st.lhs.info()
-				rhsType = st.rhs.info()
-				# TODO: check for rhs <: lhs compatibility
+				# Check for rhs <: lhs compatibility
+				#requireCompatibility(widen(st.rhs, ctx), widen(st.lhs, ctx), st.lhs)
 				output.push(tabs(indent))
 				if st.guard
 					output.push("if(")
@@ -837,8 +887,8 @@ gen = (tree, ctx, indent, output) ->
 			output.push("#{defCtx.name}.#{tree.match}")
 
 	else if tree.type is "TERM-SELECT"
-		prefixType = widen(tree.prefix, ctx)
-		requireMemberInType(tree.id, prefixType, tree)  # Typecheck: make sure id exists in prefix type
+		[prefixCtx, prefixType] = widen(tree.prefix, ctx)
+		requireMemberInType(tree.id, prefixType, prefixCtx, tree)  # Typecheck: make sure id exists in prefix type
 		gen(tree.prefix, ctx, indent, output)
 		output.push(".")
 		output.push(tree.id)
