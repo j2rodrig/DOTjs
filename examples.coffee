@@ -17,6 +17,25 @@ window.showExample = (exampleName, targetElement) ->
 			{ p = x } & Ident . new . result\n\
 			"
 
+	else if exampleName is "Polymorphic Method Invocation"
+		targetElement.value = "\
+			// Declare polymorphic method Ident\n\
+			Ident: at least {\n\
+			\	T: at least Nothing at most Any\n\
+			\	param: T\n\
+			\	result: T\n\
+			\	result = param  // assign result\n\
+			}\n\
+			\n\
+			V: { u: Any }  // declare V with field u\n\
+			\n\
+			// Call Ident with member T = V\n\
+			{\n\
+			\	T: V\n\
+			\	param = T.new\n\
+			} & Ident.new.result.u  // read field u\n\
+			"
+
 	else if exampleName is "WIP-1"
 		targetElement.value = "\
 			X: {\n\

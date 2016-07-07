@@ -5,6 +5,8 @@
 
     } else if (exampleName === "Method Type Invocation") {
       return targetElement.value = "// Define method Ident\nIdent: at least {\n\	p: T\n\	result: T\n\	result = p\n}\n\n// Call method Ident\nx: T\n{ p = x } & Ident . new . result\n";
+    } else if (exampleName === "Polymorphic Method Invocation") {
+      return targetElement.value = "// Declare polymorphic method Ident\nIdent: at least {\n\	T: at least Nothing at most Any\n\	param: T\n\	result: T\n\	result = param  // assign result\n}\n\nV: { u: Any }  // declare V with field u\n\n// Call Ident with member T = V\n{\n\	T: V\n\	param = T.new\n} & Ident.new.result.u  // read field u\n";
     } else if (exampleName === "WIP-1") {
       return targetElement.value = "X: {\n\	Y: {\n\		x:X\n\		x = Y.new\n\	}\n\	x:X\n}\n\nx:X\nX.new.x = x\nX.new.Y | {\n\	x: X\n\	x\n}.new\n";
     } else {

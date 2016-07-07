@@ -16,11 +16,9 @@ window.compile = (input, stopAfter) ->
 		predefCtx = createPredefContext()   # create a context for predefined types
 		doTypeCompleters(ast, predefCtx.fresh(ast))   # generate subcontexts and info() functions
 
-		if stopAfter == "symbols"
-			printSymbolTables(ast)
-
 		outputBuffer = []
-		genConstructor(ast, predefCtx, 0, outputBuffer)
+		[bases, ignore] = linearizedForConstruction(ast, predefCtx)
+		genConstructor(bases, ast.ctx, predefCtx, 0, outputBuffer)
 		outputBuffer.push(";")
 		output = outputBuffer.join("")
 
@@ -53,357 +51,6 @@ log = (ch, msg) ->
 		channels[ch] = [msg]
 	else
 		channels[ch].push msg
-
-###
-
-NOTES
-
-Compilers are Databases
-
-	Should I structure this compiler like Odersky's core ER (Entity Relationship) diagram?
-	Yes, that seems like a good idea.
-
-	Should I literally build tables of entities here?
-	No. But something more flexible than what Martin did is a good idea.
-
-	Is the flexibility issue I'm seeing an interface problem?
-	Yes.
-
-	How do I do infterfaces better?
-	Just think - ...
-
-What's a Type?
-
-	A type is what we know (or assume) about something.
-
-	A type may be associated with a tree (but it doesn't have to be).
-	A type may be associated with a symbol (but it doesn't have to be).
-
-	So what does a type do?
-
-	What do we want to do with a type?
-
-	We want to make sure that for every term selection p.x, p contains x.
-	We want to make sure that for every type selection p.T, p contains T.
-	We want to make sure that for every term assignment a = b, b is substitutable for a.
-	We want to make sure that for every term assignment a = b, a is assignable.
-	(Assignability is [among other things] related to variance and privacy: a field is not writable/assignable if its type is covariant and non-private [which is notably the case for all fields in DOT].)
-	We want to make sure that for every instance creation T.new, all needed members of T are known.
-	For every declaration block '{ stmts }', we want to know what declarations it contains.
-	The type of a statement block must be related to: 1. The declarations in that block (which may be inferred), and 2. the sequence of assignments in that block (term and type assignments).
-
-	What about subtyping?
-	'{ stmts1 }' <: '{ stmts2 }' if for every declaration in stmts2 there is a compatible declaration in stmts1. That is, for all D2 in stmts2, there exists a D1 in stmts1 s.t. D1 <: D2. This interpretation of statement-block subtyping is compatible with the idea that the type of a statement block is the intersection of all declarations in that block.
-
-
-	Declaration subsumption
-	We only have 2 kinds of declarations.
-	Type declarations have the form 'ID : A .. B' where A and B are types.
-	Term declarations have the form 'id : T' where T is a type.
-
-	'id1:T1' <: 'id2:T2' if T1 == T2. (May be relaxed if T1 or T2 is covariant or contravariant.)
-
-	'ID1:A1..B1 <: ID2:A2..B2' if A2 <: A1 and B1 <: B2.
-
-
-	Inheritance of Field Types
-	Despite DOT, it seems like field types should be invariant under inheritance, unless stated otherwise.
-	What does this mean for subtyping?
-
-	Scala has separate notions of a getter and setter.
-	Say, for example, A <: B. And:
-		trait D { var f: A }
-		trait E extends D { var f: B = ??? }
-	If we try
-		new E{}
-	Scala won't take it because the setter for f:A has not been defined.
-	The getter for f:A is overridden by f:B, so that part's OK.
-
-	Maybe we need to find out how getters and setters work in DOTjs:
-	{
-		f: A
-		GetF = {
-			out value: A
-			value = f
-		}
-		SetF = {
-			in value: A
-			f = value
-		}
-	}
-	Calling:
-	{
-		fOut = GetF.new.value
-		SetF{ value = fIn }.new
-	}
-	Mixing in:
-	{
-		f: B
-		GetF = {  // presence of public getter constrains f's type <: A&B
-			out value: B  // "out" means there's no way to assign outside of this object*
-			value = f
-		}
-		SetF = {  // presence of public setter constrains A|B <: f's type
-			in value: B   // "in" means there's no way to read outside of this object**
-			f = value
-		}
-	}
-	* Assignments to the value can occur within the statement block where the value is declared.
-	  Field f can be arbitrarily assigned within the block because mixin composition occurs
-	  over such assignments, and they can be type-checked at the time of object instantiation.
-	** Reads of the value can occur within the statement block where the value is declared.
-	  Like assignments, reads of values within the statement block are type-checked at the
-	  point of object creation. Access to the final type of the field allows this.
-
-
-	Mixins, declarations, and assignments
-
-	Declarations are order-agnostic. Regardless of mixin ordering, all declarations must be satisfied.
-	Satisfaction of declarations means:
-		For every declared type T, the upper bound must be no less than the lower bound.
-		All assignments to T must be within those bounds.
-		For every publically-readable field fo declared with type FO, FO serves as an upper bound
-		of the actual type of fo. For every publically-writable field fi with type FI, FI serves
-		as a lower bound of the actual type of fi.
-
-	Assignments are order-dependent.
-
-	Type assignments must be evaluated at compile time.
-	Term assignments may be evaluated at runtime.
-
-	A type assignment remains in effect only until the type is re-assigned
-	(a type assignment is a temporary narrowing of type bounds).
-
-	Here's the key:
-	Declarations participate in the static type of an object, but assignments do not.
-	(Although it is possible to infer certain declarations given a set of assignments.)
-
-	Example of type assignment:
-	J = {
-		L = Int
-		f: L
-		f = 3
-		L = String  // changes the type of L for subsequent statements
-		g: L
-		g = "Hi!"
-	}
-	j = J.new
-	l: j.L   // j.L is a string here, since that was the last assignment to L in j
-	l = "Hi again!"
-
-	Key note: (
-		All term members start as undefined, all type members as Undefined.
-		When are errors generated on use of undefined or Undefined?
-	)
-
-	Path-dependent subtyping rules allow j.L to be equal to j.L,
-	but another path k.L is not necessarily equal to j.L.
-
-(Triple venti vanilla frappucino)
-
-
-###
-
-###
-APPROACH TO TYPE CHECKING
-
-A function to get the bounds on a tree's type. (What's the result here?)
-
-A function to get the declarations on a tree's type. There are lower- and upper-bound versions.
-
-A function to get the assignments on a tree's type. Ther result is always a constructible lower bound.
-
-
-HOW TO TYPECHECK: A & { x = y } . new
-
-Register a new context for A & { x = y }    # reflects creation of new object
-Linearize statements in A & { x = y }
-Resolve and check explicit declarations in A & { x = y }
-	(the declarations in A are thereby entered into the newly-created current context.)
-Generate type aliases from type assignments (and check that they are within declared bounds).
-Infer field types (term declarations) from term assignments (where needed).
-
-Specific to { x = y }:
-	Check that y.type <: x.widen.
-	Which involves:
-		Look up y in the context where y is used (in this case, the newly-created current context)
-		Look up x in the context where x is used (in this case, the newly-created current context)
-Generalization:
-	Check that term assignments have compatible types.
-	The type of a path p is simply p itself.
-	If necessary, p is widened to its declared type.
-
-Path-dependence and A:
-	( assume A is { y: Y;  y = a } )
-	Lookup of y from { x = y } produces type Y, which may be in A's outer context.
-	( assume { Y: at least L at most U ; A = { y: Y;  y = a } } )
-	The type of p.y in "p = A & { x = y } . new" is: p.Y
-		because Y is invariant with respect to a particular object reference p.
-	So Y without a prefix is always equal to Y without a prefix, and p.Y === p.Y.
-		But: Y != p.Y and p.Y != q.Y  ---> path-dependence.
-		(unless Y is aliased to another type which does compare.)
-
-Code Generation
-
-{
-	A : at least {
-		y: Y
-		y = ???
-	}
-
-	bar = A & { x = y }.new
-	bar.x
-}
-
-(function (c0) {
-	c0.A = function (c1) {
-		c1.y = throw "Not Implemented";
-	};
-	c0.bar = (function (c2) {
-		c0.A(c2);
-		c2.x = c2.y;
-		return c2;   // return is only generated for ".new"
-	})({});
-	c0.bar.x;
-	return c0;
-})({});
-
-###
-
-###
-Progress Notes, June 14, 2016.
-
-	It seems that I should do an overhaul of how contexts are generated and used.
-Specifically, contexts should be given unique names. All user-specified names without
-prefixes are prefixed with the appropriate context name.
-
-	My previous approach is probably incorrect in another way also. Previously, I was
-assuming that all statements in all constructors could be simply linearized upon
-instantiation. However, that approach does not account for the possibility that
-constructors will access names in their enclosing contexts. Instead, I now think that
-the linearization really needs to identify not merely inherited statements, but rather
-the appropriate base-class constructors. These constructors ought to be called as
-functions in linearization order.
-
-	Javascript will handle referencing enclosing contexts via is closure mechanism.
-
-Notes, June 15
-
-	Name mangling: If I want to support custom/hidden/private(?) attributes,
-I can use a name starting with a low-frequency letter (e.g., "q"). Some escape pattern
-can be used for any user names that happen to start with that letter.
-
-	For private fields, perhaps codegen can produce Javascript variables. The closure
-mechanism will still be able to access those variables, but they will never be present
-within derived types. 
-
-	How do I proceed?
-	1. Codegen. Write it out.
-	2. ...
-
-Notes, June 17
-
-	On membership:
-	The reasons I need to know about membership are:
-	1. To determine whether a name selection is always valid (either in the current context, constructor context, or prefix context),
-	2. To find out which constructors should be called on named type instantiation.
-
-	Abstract execution plan:
-	1. Generate code for constructors. Which depends on:
-		a. Finding a sequence of base trees.
-		a1. Looking up base trees from named types in the current or enclosing contexts.
-			b1. Name declarations must be registered in their current contexts.
-			b2. Looking up declarations in a constructor context must search base trees for matching declarations.
-				c1. 
-		a2. 
-
-
-June 19.
-
-	Due to the recurive nature of path-dependent typing, I am now skeptical that a simple bottom-up approach to typing
-and linearization will work. Finding the complete membership of a type involves finding membership of its term prefix,
-which involves finding the membership of that term's type.
-
-	First, we need to be able to move from contexts to trees. This will allow examination of type trees to determine
-members, base types, etc.
-
-	Second, we may need a findMember that searches type trees for specific named members. The inputs to findMember are
-a prefix type tree and a name. The result of findMember is a type tree. To support unions and intersections, synthetic type trees
-may be created.*
-
-	Third, we need a findMember that searches within a context. If searching a constructor context, we switch to the
-findMember that searches through type trees.
-
-*There is a canonical form for any type tree: (S1 & ... & SN) | ... | (T1 & ... & TM) where every Sn and Tm is a
-statement block.
-
-June 21.
-
-	How do we generate mixin constructors?
-
-	Say we have:
-		T : { a } & { b }
-	When we go to construct an instance of T:
-		T.new
-	we need to have a mixin constructor for T that builds an object with a type compatiable with T.
-	Compatibility with T means that the constructed object's type must be compatible with T's lower bound.
-
-	As for the statments that go into T's mixin constructor, we can select any statements we want.
-	However, we should at least make an effort to ensure that all fields declared in T's lower bound get initialized
-	and initialized in a reasonable order, even if the lower bound of T contains union types.
-	The solution here is to traverse the lower-bound type of T all the way down to concrete statements,
-	and generate all term-like statements in the order that they appear.
-	For consistency, we may say that Nothing contains no statements (although it contains all possible
-	declarations). By saying that Nothing contains no statements, the lower bound of an intersection type
-	A & B -- although quite possibly containing a union with Nothing -- will still be constructible and
-	generate all expected statements. There is still an issue with implementation inheritance, however:
-	after narrowing a type member's bounds, one would expect that the statements in a newly-declared
-	lower bound would supercede -- not append to -- statements in the previously-declared lower bound.
-
-	The issue of implementation inheritance would benefit from some more thought...
-
-	For now, it suffices to say that side-effect-free constructors called in linearization order should
-	produce a reasonable result; term-member initializations override any prior conflicting initializations
-	at runtime, and indeed unneeded prior initializations are potentially elidable through optimization.
-
-	Perhaps the best thing to do here is try some examples after codegen is completed.
-
-
-	Another issue is what to do about out-of-order statements. For now, nothing. Ideally, statements
-would be reordered based on depenency. But this doesn't have to happen yet.
-
-
-June 24.
-
-	I may need to re-think exactly how/when symbols are added to contexts. There are problems with circular references in symbol lookups.
-
-	1. Remove contexts on STATEMENTS trees, leaving only constructor/mixin-constructor contexts.
-	2. Constructor membership is evaluated lazily. Basically, requesting a member of a context forces
-	   computation of the entire memberhsip set for that context. For each constructor, the membership
-	   set is always computed before any element is selected from it.
-
-	Possible way to break this approach:
-		x: L
-		L: x.K   // the membership of L depends on a member of L. It's probably OK to treat this as an error
-
-	Possible counter-counter example:
-	L: {
-		H: at most L   // OK. The mixin context surrounding L here is evaluated lazily, so all members of L are established before we get here.
-	}
-
-July 2.
-
-	The problem of symbol lookup seems to be solved. Up next: Type comparison.
-
-July 4.
-
-	There is a problem with type lookup:
-		Which context do we start with when looking into a type?
-		If we use the original context, that works, but the result is conservative, so we don't get all the benefits of path-dependent typing.
-		Specifically, we don't get type polymorphism.
-	Instead, we need to look up type IDs from the current context (rather than the original context).
-
-###
 
 Any =
 	type: "ANY"
@@ -505,6 +152,7 @@ createPredefContext = () ->
 	predefTree =
 		type: "STATEMENTS"
 		statements: []
+	predefTree.stringify = (indent) -> "{ (predefined symbols) }"
 	predefTree.statements.push TypeDecl(
 		Token("ID", "Any", undefined, undefined),
 		Any, Any
@@ -517,6 +165,7 @@ createPredefContext = () ->
 		Token("ID", "???", undefined, undefined), Nothing
 	)
 	ctx = freshContext(undefined, predefTree)
+	ctx.outer = ctx  # circular reference to outermost context (for convenience)
 	Any.ctx = ctx   # hack: make the contexts of predefined types point to the predef context
 	Nothing.ctx = ctx
 	ctx
@@ -588,6 +237,8 @@ findMember = (name, typTree, ctx, returnLowerBound, logIndent) ->  # params: nam
 			rhsType
 		else if not rhsType
 			lhsType
+		else if returnLowerBound
+			OrType(lhsType, rhsType)
 		else
 			AndType(lhsType, rhsType)
 
@@ -626,24 +277,22 @@ widen = (tree, ctx, returnLowerBound, logIndent = 0) ->
 
 
 findMemberInContext = (name, ctx, returnLowerBound, logIndent) ->
-	if not ctx
-		undefined
+	found = ctx.findMember(name, returnLowerBound, logIndent)
+	if found
+		found
+	else if ctx isnt ctx.outer
+		findMemberInContext(name, ctx.outer, returnLowerBound, logIndent)
 	else
-		found = ctx.findMember(name, returnLowerBound, logIndent)
-		if found
-			found
-		else
-			findMemberInContext(name, ctx.outer, returnLowerBound, logIndent)
+		undefined
 
 # Finds the context that defines the given name, if it is in ctx or enclosing.
 getDefContext = (name, ctx) ->
-	if not ctx
-		undefined
+	if ctx.findMember(name)
+		ctx
+	else if ctx isnt ctx.outer
+		getDefContext(name, ctx.outer)
 	else
-		if ctx.findMember(name)
-			ctx
-		else
-			getDefContext(name, ctx.outer)
+		undefined
 
 # Throws an error if the given name is not defined in the given or enclosing contexts.
 requireMemberInContext = (name, ctx, sourceTree, returnLowerBound, logIndent) ->
@@ -667,17 +316,31 @@ requireDefContext = (name, ctx, sourceTree) ->
 
 ### BASE/CONSTRUCTOR TYPE QUERIES ###
 
+
+typeAsConstructed = (tree, ctx) ->
+	[bases, problemBase, stmts] = linearizedForConstruction(tree, ctx)
+	if bases is false
+		throw new Error("Cannot construct object at line #{tree.line} character #{tree.column} because base type #{problemBase.stringify(0)} is non-constructible.")
+	typ = Any
+	for stmt in stmts
+		if typ is Any
+			typ = stmt
+		else
+			typ = AndType(typ, stmt)
+	typ
+
+###
 typeAsConstructed = (typTree, ctx) ->
 
 	# We return the intersection base types here (instead of the original type tree).
 	# This allows us to look at the membership of the object as actually constructed, rather than
 	#  a conservative upper-bound approximation.
 	typ = Any
-	for block in findBaseStatementBlocks(typTree, ctx)
+	for block in findBaseStatementBlocks(typTree, ctx, typTree)
 		typ = AndType(typ, block)
-	typ
+	typ  # TODO: simplify?
 
-findBaseStatementBlocks = (typTree, ctx) ->
+findBaseStatementBlocks = (typTree, ctx, origTypTree) ->
 
 	if typTree._baseStatementBlocks
 		return typTree._baseStatementBlocks
@@ -685,25 +348,31 @@ findBaseStatementBlocks = (typTree, ctx) ->
 	statementsFound = []
 	basesSeen = []
 
-	for base in getBaseTypes(typTree)
+	[bases, baseWithProblem] = linearizedForConstruction(typTree, ctx)
+	if bases is false
+		throw new Error("Cannot construct object at line #{origTypTree.line} character #{origTypTree.column} because base type #{baseWithProblem.stringify(0)} is non-constructible.")
+
+	for base in bases
 		if not (base in basesSeen)
 			basesSeen.push base
 			if base.type in ["STATEMENTS", "ANY", "NOTHING"]
 				statementsFound.push base
 			else if base.type in ["ID", "TYPE-SELECT"]
-				[ignore, widenedType] = widen(base, ctx, true)
-				for stmts in findBaseStatementBlocks(widenedType, widenedType.ctx.outer)
+				if not ctx?
+					ctx = base.ctx  # set default context?
+				[wCtx, wTyp] = widen(base, ctx, true)
+				for stmts in findBaseStatementBlocks(wTyp, undefined, origTypTree)  # do we use wTyp.ctx.outer, wCtx, wCtx.outer, undefined, or else for the context?
 					if not (stmts in basesSeen)
 						basesSeen.push stmts
 						statementsFound.push stmts
-			else if base.type is Any or base.type is Nothing
-				statementsFound.push base
 			else
 				throw new Error("Internal complier error: unexpected base tree type #{base.type} in findBaseStatementBlocks")
 
 	typTree._baseStatementBlocks = statementsFound
 	statementsFound
+###
 
+###
 getBaseTypes = (typTree) ->
 
 	if typTree.type in ["ID", "TYPE-SELECT"]
@@ -723,14 +392,88 @@ getBaseTypes = (typTree) ->
 		lhsBases = getBaseTypes(typTree.lhs)
 		rhsBases = getBaseTypes(typTree.rhs)
 		for b in lhsBases
-			if b is Nothing or b.match is "Nothing"
+			if b.type is "NOTHING" or b.match is "Nothing"
 				return rhsBases
 		lhsBases
 	else if typTree.type in ["STATEMENTS", "ANY", "NOTHING"]
 		[typTree]
 	else
 		throw new Error("Internal compiler error: Expected a type tree in getBaseTypes, got #{typTree.type} tree")
+###
 
+# Finds the sequence of base types needed to construct an object of the given type tree.
+# Returns a pair [lin, base]. If the type is constructible, lin is an array of base types. If not, lin is false and base is the base type that cannot be constructed.
+linearizedForConstruction = (tree, ctx) ->
+
+	if tree._linearization
+		return [tree._linearization, undefined, tree._statements]
+	else
+		tree._linearization = []
+		tree._statements = []
+
+	if tree.type in ["ID", "TYPE-SELECT"]
+		tree._linearization.push tree
+
+		# Make sure we can linearize higher base classes
+		[wCtx, wTyp] = widen(tree, ctx, true)
+		[lin, ignore, stmt] = linearizedForConstruction(wTyp, wCtx)
+		if lin is false
+			tree._linearization = false
+			return [false, tree, undefined]
+		tree._statements = tree._statements.concat stmt
+
+	else if tree.type is "AND-TYPE"
+		[linLhs, baseLhs, stmtLhs] = linearizedForConstruction(tree.lhs, ctx)
+		if linLhs is false
+			tree._linearization = false
+			return [false, baseLhs, undefined]
+
+		[linRhs, baseRhs, stmtRhs] = linearizedForConstruction(tree.rhs, ctx)
+		if linRhs is false
+			tree._linearization = false
+			return [false, baseRhs, undefined]
+
+		tree._linearization = tree._linearization.concat linLhs
+		tree._statements = tree._statements.concat stmtLhs
+		tree._linearization = tree._linearization.concat linRhs
+		tree._statements = tree._statements.concat stmtRhs
+
+	else if tree.type is "OR-TYPE"
+		# Here, we've got to choose which branch of the OrType gets instantiated.
+		# The default policy I go with here is to select the leftmost branch unless it is non-constructible.
+		# By choosing the leftmost branch, members of types earlier in the linearization order override members later in the order.
+		# The result of this policy is that declarations are narrowed from right to left, but assignments are executed from
+		#  left to right. This allows the most specific declarations and the earliest-executed terms to be grouped together
+		#  in the leftmost base type.
+		log(types, "Considering OrType #{tree.stringify(0)}")
+		[linLhs, baseLhs, stmtLhs] = linearizedForConstruction(tree.lhs, ctx)
+		if linLhs is false
+			[linRhs, baseRhs, stmtRhs] = linearizedForConstruction(tree.rhs, ctx)
+			if linRhs is false
+				tree._linearization = false
+				return [false, baseRhs, undefined]
+			tree._linearization = tree._linearization.concat linRhs
+			tree._statements = tree._statements.concat stmtRhs
+		else
+			tree._linearization = tree._linearization.concat linLhs
+			tree._statements = tree._statements.concat stmtLhs
+
+	else if tree.type is "NOTHING"
+		tree._linearization = false
+		return [false, tree, undefined]
+
+	else if tree.type is "STATEMENTS"
+		tree._linearization.push tree
+		tree._statements.push tree
+
+	else if tree.type is "ANY"
+		# No action needed
+
+	else
+		throw new Error("Internal compiler error: Expected a type tree in linearizedForConstruction, got #{tree.type} tree")
+
+	#TODO: remove duplicates?
+	[tree._linearization, undefined, tree._statements]
 
 
 ### LAZY INFO FUNCTIONS ... TODO: Do we really need these? ###
@@ -840,12 +583,15 @@ gen = (tree, ctx, indent, output) ->
 	if tree.type is "STATEMENTS"
 		for st in tree.statements
 			if st.type is "TYPE-DECL"
-				output.push(tabs(indent))
-				defCtx = requireDefContext(st.lhs.match, ctx, tree)
-				output.push("#{defCtx.name}.#{st.lhs.match}")
-				output.push(" = ")
-				genInitializer(st.rhsLower, indent, output)
-				output.push(";\n")
+				[bases, baseWithProblem] = linearizedForConstruction(st.rhsLower, ctx)
+				if bases  # skip generating an initializer if the type is non-constructible
+					output.push(tabs(indent))
+					defCtx = requireDefContext(st.lhs.match, ctx, tree)
+					output.push("if(!#{defCtx.name}.#{st.lhs.match}){")  # define an initializer only if a same-named initializer has not been defined yet
+					output.push("#{defCtx.name}.#{st.lhs.match}")
+					output.push(" = ")
+					genInitializer(bases, st.rhsLower.ctx, ctx, indent, output)
+					output.push(";}\n")
 
 		for st in tree.statements
 			if st.type is "TERM-ASSIGN"
@@ -877,7 +623,10 @@ gen = (tree, ctx, indent, output) ->
 					throw new Error("Unexpected guard on #{st.type} statement on line #{st.guard.line}")
 
 	else if tree.type is "CONSTRUCT"
-		genConstructor(tree.typTree, ctx, indent, output)
+		[bases, baseWithProblem] = linearizedForConstruction(tree.typTree, ctx)
+		if bases is false
+			throw new Error("Cannot construct the object at line #{tree.line} character #{tree.column} because base type '#{baseWithProblem.stringify(0)}' is non-constructible.")
+		genConstructor(bases, tree.typTree.ctx, ctx, indent, output)
 
 	else if tree.type is "id"
 		if tree.match is "???"
@@ -893,26 +642,9 @@ gen = (tree, ctx, indent, output) ->
 		output.push(".")
 		output.push(tree.id)
 
-genInitializer = (tree, indent, output) ->
-	ctx = tree.ctx
+genInitializer = (bases, ctx, outer, indent, output) ->
+	# TODO: hoist type assignments?
 	output.push("function(#{ctx.name}){\n")
-	bases = getBaseTypes(tree)   # TODO remove duplicates?
-
-	# Here, generate statements only. Calls to other initializers should really be hoisted into constructors
-	for base in bases
-		if base.type is "STATEMENTS"
-			gen(base, ctx, indent + 1, output)
-
-	output.push(tabs(indent + 1))
-	output.push("return #{ctx.name};\n")
-	output.push(tabs(indent))
-	output.push("}")
-
-genConstructor = (tree, outer, indent, output) ->
-	ctx = tree.ctx
-	output.push("(function(#{ctx.name}){\n")
-	bases = getBaseTypes(tree)   # TODO remove duplicates?
-
 	for base in bases
 		if base.type is "STATEMENTS"
 			gen(base, ctx, indent + 1, output)
@@ -926,8 +658,30 @@ genConstructor = (tree, outer, indent, output) ->
 			output.push(".#{base.ID}(#{ctx.name});\n")
 		else if base.type is "ANY"
 			# don't need to do anything with Any
-		else if base.type is "NOTHING"
-			throw new Error("Cannot construct an object with a base class of Nothing. Constructor at line #{tree.line} character #{tree.column}")
+		else
+			throw new Error("Internal compiler error: Unexpected base type tree #{base.type} in genConstructor. Line #{tree.line} character #{tree.column}")
+
+	output.push(tabs(indent + 1))
+	output.push("return #{ctx.name};\n")
+	output.push(tabs(indent))
+	output.push("}")
+
+genConstructor = (bases, ctx, outer, indent, output) ->
+	output.push("(function(#{ctx.name}){\n")
+	for base in bases
+		if base.type is "STATEMENTS"
+			gen(base, ctx, indent + 1, output)
+		else if base.type is "ID"
+			if base.match isnt "Any"  # hack: don't generate constructor calls to the predefined type Any
+				defCtx = requireDefContext(base.match, outer, base)
+				output.push(tabs(indent + 1))
+				output.push("#{defCtx.name}.#{base.match}(#{ctx.name});\n")
+		else if base.type is "TYPE-SELECT"
+			output.push(tabs(indent + 1))
+			gen(base.prefix, outer, indent + 1, output)
+			output.push(".#{base.ID}(#{ctx.name});\n")
+		else if base.type is "ANY"
+			# don't need to do anything with Any
 		else
 			throw new Error("Internal compiler error: Unexpected base type tree #{base.type} in genConstructor. Line #{tree.line} character #{tree.column}")
 
@@ -1286,6 +1040,22 @@ parse = (tokens) ->
 			stack.push t
 			return true
 
+		# adds an annotation to a type. We do this after &-type and |-type so that the annotation applies to the entire type expression.
+		if matches(["AT", "id", "TYPE"])
+			t = stack.pop()
+			id = stack.pop()
+			stack.pop()
+			if t.annots
+				t.annots.push id
+			else
+				t.annots = [id]
+			prevStringify = t.stringify
+			prevSubtrees = t.subtrees
+			t.stringify = (indent) -> "@" + t.id.match + " " + prevStringify(indent)
+			t.subtrees = () -> prevSubtrees().concat([t.typ])
+			stack.push t
+			return true
+
 		if matches(["STATEMENTS", "*", "NEWLINE"])
 			stack.pop()
 			if matches(["TERM"])
@@ -1387,8 +1157,6 @@ tokenize = (input) ->
 	column = 1
 
 	tokenList = [
-		{ name: "GUARD_ARROW", regex: /^=>/ }
-
 		{ name: "id", regex: /^([a-z][a-zA-z0-9_]*|\?\?\?)/ }
 		{ name: "ID", regex: /^[A-Z][a-zA-z0-9_]*/ }
 
@@ -1400,12 +1168,14 @@ tokenize = (input) ->
 		{ name: "DOT", regex: /^\./ }
 		{ name: "AND", regex: /^&/ }
 		{ name: "OR", regex: /^\|/ }
+		{ name: "AT", regex: /^@/ }
 		{ name: "EQUALS", regex: /^=/ }
 		{ name: "LPAREN", regex: /^\(/ }
 		{ name: "RPAREN", regex: /^\)/ }
 		{ name: "LBRACE", regex: /^{/ }
 		{ name: "RBRACE", regex: /^}/ }
 		{ name: "COLON", regex: /^:/ }
+		{ name: "SEMI", regex: /^;/ }
 		{ name: "EOF", regex: /^$/ }
 	]
 	Whitespace = { name: "SPACE", regex: /^[\t \v\f]+/ }

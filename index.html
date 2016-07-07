@@ -96,6 +96,7 @@
 					&emsp; [ <i>term</i> '.' ] <i>ID</i><br>
 					&emsp; <i>type</i> '&amp;' <i>type</i><br>
 					&emsp; <i>type</i> '|' <i>type</i><br>
+					&emsp; '@' id <i>type</i><br>
 				</p>
 				<p><i>term</i> ::= <br>
 					&emsp; [ <i>term</i> '.' ] <i>id</i><br>
@@ -103,9 +104,14 @@
 				</p>
 			</td>
 			<td style="vertical-align:top;">
-				<h2>Predefined Symbols</h2>
+
+				<h2>Predefined Types</h2>
 				<p>Any &ndash; Declares no members. A supertype of all other types.</p>
 				<p>Nothing &ndash; Declares all possible members. Non-constructible. A subtype of all other types.</p>
+
+
+				<h2>Predefined Terms</h2>
+				<p>??? &ndash; A term of type Nothing. Throws a "Not Implemented" exception when executed.</p>
 			</td>
 		</tr>
 	</table>
@@ -120,6 +126,7 @@
 						<select style="font-size:1em" onchange="showExample(this.value, document.getElementById('textarea-input'))">
 							<option value="">Examples</option>
 							<option value="Method Type Invocation">Method Type Invocation</option>
+							<option value="Polymorphic Method Invocation">Polymorphic Method Invocation</option>
 							<option value="WIP-1">WIP-1</option>
 						</select>
 					</td>
