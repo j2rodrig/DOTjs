@@ -382,5 +382,66 @@ July 6.
 	If we consider the bit 1=@readonly, and interpret & as bitwise intersection and | as bitwise union, then
 		the intersection of base types is readonly only if all bases are readonly, and versa for unions.
 
+July 11.
+
+	Discovered that the type system as-implemented doesn't really do path-dependent typing. During type comparisons,
+	it is still sometimes interpreting x.L as x.type#L. For example:
+
+		X:{
+			Y:at most Any
+			y:Y
+		}
+		
+		x:X
+		y:x.Y
+		y = x.y  // Should not produce an error, but does. Complains about comparing "Y" to "x.Y".
+
+		x1:X
+		x2:X
+		x2.y = x1.y  // Should produce an error, but doesn't.
+
+	The basic problem here is that prefixes are stripped when types are widened, which is incorrect.
+	There are rules about self packing and unpacking in DOT, which I have not implemented. These rules require substitutions,
+	in particular substitution of a prefix variable for a self-ref and vice versa. The questions now are:
+	- What substitutions need to be performed to implement these rules?
+	- When do these substitutions need to be performed?
+
+	A possible answer to the "what" question depends on the fact that a NoPrefix ID actually does have a prefix,
+	and that prefix is a reference to its defining context. In Dotty, there is a notion of a ThisType, which
+	is used to prefix IDs with references to named-class instances.
+	In DOTjs, we don't have a notion of a named class--instead, we have contexts. An ID in DOTjs ought to be
+	associated with its defining context, and the substitution involves making a copy of the type tree where
+	all instances of every ID with a given context are replaced with a type selection that's valid in the
+	current context.
+
+	Actually, every ID, id, TYPE-SELECT, and TERM-SELECT are understood to be prefixed with a context that is current.
+	Every widening of an ID or TYPE-SELECT involves a replacement. This is the answer to the "when" question.
+
+July 12.
+
+	We need a tree copier.
+	The purpose of the tree copier is to take any tree, and return either the unmodified original tree, or
+	a mutated version of that tree.
+
+	(later) The tree copier has been completed, but the context/prefix substitutions are not happening correctly.
+	I think there is a bigger problem in how contexts are being handled.
+	The whole term lookup system has to be rebased.
+	Specifically, we need to be very clear about which contexts are being referred to by each type lookup.
+
+	Now, about the idea of reworking the compiler from scratch: There are advantages to this. First, you
+	learn more (if you haven't already built a compiler). Second, you are able to explain better what you
+	know (otherwise, you're referring to what's in somebody else's head, which may or may not be any
+	clearer than what's in yours).
+
+	On the progression of research: It is not enough to assert that somebody knows something. If you yourself
+	do not know it, then it does you no good. Approximations of what somebody else knows are fine, since these
+	allow you to enlist/engage somebody else's knowledge, but if the approximations are too poor, then
+	it is impossible to engage them or use their knowledge effectively. [Stand on this fact.]
+
+July 13.
+
+	[Current assumption: The lower bound of a type declaration is also a type assignment.]
+
+	
 
 ###

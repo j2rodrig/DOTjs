@@ -1,0 +1,13 @@
+July 8.
+
+	The Question of Evaluation
+
+	How do we know that the reference immutability system is correct, safe, and practical?
+
+	Steps (not necessarily in linearized order):
+	*. Implement DOTjs.
+	*. Implement annotation systems for RI and purity in DOTjs. Speculate about complier extensions.
+	*. Show that DOTjs maps to DOT.
+	*. Show that the RI annotation system is sound.
+	*. Show how common Scala idioms translate to DOTjs.
+	*. Show how the idioms may be annotated in DOTjs. (and possibly: how those annotations map back to Scala.)

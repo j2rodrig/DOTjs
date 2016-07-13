@@ -86,9 +86,9 @@
 				<p><i>id</i> ::= a term identifier (begins with a lower-case letter)<br>
 					<i>ID</i> ::= a type identifier (begins with an upper-case letter)</p>
 				<p><i>statement</i> ::= <br>
-					&emsp; <i>ID</i> ':' 'at least' <i>type</i> [ 'at most' <i>type</i> ]<br>
-					&emsp; <i>ID</i> ':' <i>type</i><br>
-					&emsp; <i>id</i> ':' <i>type</i><br>
+					&emsp; [ 'type' ] <i>ID</i> ':' 'at least' <i>type</i> [ 'at most' <i>type</i> ]<br>
+					&emsp; [ 'type' ] <i>ID</i> ':' <i>type</i><br>
+					&emsp; [ 'var' | 'val' ] <i>id</i> ':' <i>type</i><br>
 					&emsp; [ 'if' <i>term</i> 'then' ] [ [ <i>term</i> '.' ] <i>id</i> '=' ] <i>term</i><br>
 				</p>
 				<p><i>type</i> ::= <br>
@@ -125,6 +125,7 @@
 					<td>
 						<select style="font-size:1em" onchange="showExample(this.value, document.getElementById('textarea-input'))">
 							<option value="">Examples</option>
+							<option value="Path-dependent Type Selection">Path-dependent Type Selection</option>
 							<option value="Method Type Invocation">Method Type Invocation</option>
 							<option value="Polymorphic Method Invocation">Polymorphic Method Invocation</option>
 							<option value="WIP-1">WIP-1</option>

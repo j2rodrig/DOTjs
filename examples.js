@@ -3,6 +3,8 @@
   window.showExample = function(exampleName, targetElement) {
     if (exampleName === "") {
 
+    } else if (exampleName === "Path-dependent Type Selection") {
+      return targetElement.value = "X:{\n\	Y:at most Any\n\	y:Y\n}\nx:X\ny:x.Y\ny = x.y\n";
     } else if (exampleName === "Method Type Invocation") {
       return targetElement.value = "// Define method Ident\nIdent: at least {\n\	p: T\n\	result: T\n\	result = p\n}\n\n// Call method Ident\nx: T\n{ p = x } & Ident . new . result\n";
     } else if (exampleName === "Polymorphic Method Invocation") {

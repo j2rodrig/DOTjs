@@ -3,6 +3,18 @@ window.showExample = (exampleName, targetElement) ->
 	if exampleName is ""
 		# do nothing
 
+
+	else if exampleName is "Path-dependent Type Selection"
+		targetElement.value = "\
+			X:{\n\
+			\	Y:at most Any\n\
+			\	y:Y\n\
+			}\n\
+			x:X\n\
+			y:x.Y\n\
+			y = x.y\n\
+			"
+
 	else if exampleName is "Method Type Invocation"
 		targetElement.value = "\
 			// Define method Ident\n\
