@@ -11,8 +11,12 @@ window.compile = (input, stopAfter) ->
 		ast = parse(tokens)
 
 		if stopAfter == "trees"
-			return ast.print(0)
+			return ast.stringify(0)
 
+
+		contextify(ast, createPredefTree(), ast)
+
+		###
 		predefCtx = createPredefContext()   # create a context for predefined types
 		doTypeCompleters(ast, predefCtx.fresh(ast))   # generate subcontexts and info() functions
 
@@ -21,6 +25,7 @@ window.compile = (input, stopAfter) ->
 		genConstructor(bases, ast.ctx, predefCtx, 0, outputBuffer)
 		outputBuffer.push(";")
 		output = outputBuffer.join("")
+		###
 
 		allOutput = [output]
 		if channels[types] then allOutput.push("/** Types log:\n\n" + channels[types].join("\n") + "\n**/")
@@ -277,7 +282,7 @@ replaceContextWithContext = (typ, fromCtx, toCtx) ->
 
 ### CONTEXTS AND SYMBOL/MEMBER LOOKUP ###
 
-createPredefContext = () ->
+createPredefTree = () ->
 	predefTree =
 		type: "STATEMENTS"
 		statements: []
@@ -293,13 +298,20 @@ createPredefContext = () ->
 	predefTree.statements.push TermDecl(
 		Token("ID", "???", undefined, undefined), Nothing
 	)
+	predefTree
+
+
+###
+createPredefContext = () ->
+	predefTree = createPredefTree()
 	ctx = freshContext(undefined, predefTree)
 	ctx.outer = ctx  # circular reference to outermost context (for convenience)
 	Any.ctx = ctx   # hack: make the contexts of predefined types point to the predef context
 	Nothing.ctx = ctx
 	ctx
+###
 
-
+###
 freshContext = (outer, typTree) ->
 	ctx = {}
 
@@ -480,10 +492,12 @@ requireDefContext = (name, ctx, sourceTree) ->
 	if not found
 		throw new Error("Name '#{name}' is not defined at line #{sourceTree.line} character #{sourceTree.column}")
 	found
+###
 
 
 ### BASE/CONSTRUCTOR TYPE QUERIES ###
 
+###
 typeAsConstructed = (tree, ctx) ->
 	[bases, problemBase, stmts] = linearizedForConstruction(tree, ctx)
 	if bases is false
@@ -583,10 +597,194 @@ linearizedForConstruction = (tree, ctx) ->
 
 	#TODO: remove duplicates?
 	[tree._linearization, undefined, tree._statements]
+###
+
+### CONTEXTIFY ###
+
+findMember = (name, typTree, lowerBound) ->
+
+	if typTree.type is "STATEMENTS"
+		for st in typTree.statements
+			if st.type is "TYPE-DECL" and st.lhs.match is name
+				return if lowerBound then st.rhsLower else st.rhsUpper
+			else if st.type is "TERM-DECL" and st.lhs.match is name
+				return st.rhs
+		undefined
+
+	else if typTree.type is "ID" or typTree.type is "TYPE-SELECT"
+		expanded = requireMember(typTree, false)
+		findMember(name, expanded, lowerBound)
+
+	else if typTree.type is "AND-TYPE"
+		lhsTyp = findMember(name, typTree.lhs, lowerBound)
+		rhsTyp = findMember(name, typTree.rhs, lowerBound)
+		if lhsTyp and rhsTyp   # the name defined in both sides of the and-type
+			if lowerBound
+				OrType(lhsTyp, rhsTyp)   # lower bound is an or-type
+			else
+				AndType(lhsTyp, rhsTyp)  # upper bound is an and-type
+		else if lhsTyp
+			lhsTyp   # only LHS defines the name
+		else
+			rhsTyp   # only RHS (or neither side) defines this name
+
+	else if typTree.type is "OR-TYPE"
+		lhsTyp = findMember(name, typTree.lhs, lowerBound)
+		rhsTyp = findMember(name, typTree.rhs, lowerBound)
+		if lhsTyp and rhsTyp   # the name defined in both sides of the or-type
+			if lowerBound
+				AndType(lhsTyp, rhsTyp)  # lower bound is an and-type
+			else
+				OrType(lhsTyp, rhsTyp)   # upper bound is an or-type
+		else
+			undefined  # at least one side does not define the name
+
+	else if typTree.type is "CONSTRUCT"
+		findMember(name, asConstructed(typTree.typTree))
+
+	else if typTree.type is "ANY"
+		undefined
+
+	else if typTree.type is "NOTHING"
+		throw new Error("Attempt to find member '#{name}' in type Nothing, which contains contradictory definitions of '#{name}'.")
+
+	else
+		throw new Error("Internal compiler error: Expected a type tree in findMember(\"#{name}\"), got '#{typTree.type}' tree")
+
+asConstructed = (typTree) ->  # takes any type and returns a constructible version without OrTypes
+	# TODO: complete
+	# TODO: memoize the result so that results from different calls are known to be equivalent
+	typTree
+
+requireMember = (nameTree, lowerBound) ->
+
+	typTree =
+		if nameTree.type is "id" or nameTree.type is "ID"
+			typ = undefined
+			enclosing = nameTree.enclosing
+			while enclosing and not typ
+				typ = findMember(nameTree.match, enclosing, lowerBound)
+				enclosing = enclosing.enclosing
+			nameTree.definingTree = enclosing   # remember which type tree actually defines this name (important for type unpacking)
+			typ
+
+		else if nameTree.type is "TYPE-SELECT"
+			prefixTyp = requireMember(nameTree.prefix, false)
+			typ = findMember(nameTree.ID, prefixTyp, lowerBound)
+			typ = replaceSelfWithPrefix(typ, prefixTyp, nameTree.prefix)  # replace all Ids where nameTree.definingTree==prefixTyp with TypeSelect(prefix,ID)
+			typ
+
+		else if nameTree.type is "TERM-SELECT"
+			prefixTyp = requireMember(nameTree.prefix, false)
+			typ = findMember(nameTree.id, prefixTyp, lowerBound)
+			typ = replaceSelfWithPrefix(typ, prefixTyp, nameTree.prefix)  # replace all Ids where nameTree.definingTree==prefixTyp with TermSelect(prefix,id)
+			typ
+
+		else if nameTree.type is "CONSTRUCT"   # the "named" thing here is anonymous
+			nameTree  # return the constructor itself
+
+		else
+			throw new Error("Internal compiler error: Expected name tree in requireMember, got '#{nameTree.type}'")
+
+	if not typTree
+		throw new Error("Error: Unable to find type of '#{nameTree.stringify(0)}' on line #{nameTree.line} character #{nameTree.column}")
+	else
+		typTree
+
+replaceSelfWithPrefix = (typ, enclosing, prefix) ->
+	# replace all Ids where IdTree.definingTree == enclosing with TypeSelect(prefix, ID) or TermSelect(prefix, ID)
+	deepCopyTree(typ, (t) ->
+		if t.type is "ID"
+			requireMember(t)   # make sure definingTree is initialized for this ID
+			if t.definingTree is enclosing
+				log(types, "Replacing self.#{t.match} with #{prefix.stringify(0)}.#{t.match} where self:#{enclosing.stringify(0)}")
+				t1 = shallowCopyTree(t)
+				t1.type = "TYPE-SELECT"
+				t1.ID = t.match
+				t1.prefix = prefix
+				t1.stringify = (indent) -> "#{t1.prefix.stringify(indent)}.#{t1.ID}"
+				return t1
+		if t.type is "id"
+			requireMember(t)   # make sure definingTree is initialized for this id
+			if t.definingTree is enclosing
+				log(types, "Replacing self.#{t.match} with #{prefix.stringify(0)}.#{t.match} where self:#{enclosing.stringify(0)}")
+				t1 = shallowCopyTree(t)
+				t1.type = "TERM-SELECT"
+				t1.id = t.match
+				t1.prefix = prefix
+				t1.stringify = (indent) -> "##{t1.prefix.stringify(indent)}.{t1.id}"
+				return t1
+		t
+	)
+	###
+	deepCopyTree(typ, (t, insideStatement) ->
+		#
+		# For every id and ID that is defined in the given context, turn it into a select with the given prefix.
+		# We need to transform prefix-less identifiers only, since only identifiers are implicitly understood
+		# to be prefixed with a self-reference.
+		#
+		if t.type is "ID"
+			startCtx = if insideStatement then t.ctx else t.ctx.outer   # if we're inside a statement, look up in the current context, otherwise enclosing context
+			if getDefContext(t.match, startCtx) is ctx
+				t1 = shallowCopyTree(t)
+				t1.type = "TYPE-SELECT"
+				t1.ID = t.match
+				t1.prefix = prefix
+				t1.stringify = (indent) -> "#{t1.ID}.#{t1.prefix.stringify(indent)}"
+				return t1
+		if t.type is "id"
+			startCtx = if insideStatement then t.ctx else t.ctx.outer
+			if getDefContext(t.match, startCtx) is ctx
+				t1 = shallowCopyTree(t)
+				t1.type = "TERM-SELECT"
+				t1.id = t.match
+				t1.prefix = prefix
+				t1.stringify = (indent) -> "#{t1.id}.#{t1.prefix.stringify(indent)}"
+				return t1
+		t
+	)
+	###
+
+contextify = (currentTree, enclosingTree, freshTree) ->
+
+	if tree.type is "STATEMENTS"
+		freshTree.enclosing = enclosingTree  # allow lookup into outer contexts
+		enclosingTree = freshTree   # we've stepped inside the type; the fresh type becomes the enclosing type
+		for st in tree.statements
+			if st.type is "TERM-DECL"
+				contextify(st.rhs, enclosingTree, st.rhs)  # we have a fresh type on the right-hand side
+			else if st.type is "TYPE-DECL"
+				contextify(st.rhsLower, enclosingTree, st.rhsLower)  # two fresh type trees
+				contextify(st.rhsUpper, enclosingTree, st.rhsUpper)
+			else if st.type is "TYPE-ASSIGN"
+				contextify(st.rhs, enclosingTree, st.rhs)   # we have a fresh type on the right-hand side
+			else if st.type is "TERM-ASSIGN"
+				if st.guard then contextify(st.guard, enclosingTree, freshTree)
+				contextify(st.lhs, enclosingTree, freshTree)
+				contextify(st.rhs, enclosingTree, freshTree)
+			else
+				throw new Error("Internal compiler error: Unexpected '#{tree.type}' tree in statement block")
+
+	else if tree.type is "ID" or tree.type is "id"
+		currentTree.enclosing = enclosingTree
+
+	else if tree.type is "TYPE-SELECT" or tree.type is "TERM-SELECT"
+		contextify(tree.prefix, enclosingTree, freshTree)
+
+	else if tree.type is "AND-TYPE" or tree.type is "OR-TYPE"
+		contextify(tree.lhs, enclosingTree, freshTree)
+		contextify(tree.rhs, enclosingTree, freshTree)
+
+	else if tree.type is "CONSTRUCT"
+		contextify(tree.typTree, enclosingTree, tree.typTree)   # new fresh type tree
+
+	else
+		throw new Error("Internal compiler error: Unexpected '#{tree.type}' tree in contextify")
 
 
 ### LAZY INFO FUNCTIONS ... TODO: Do we really need these? ###
 
+###
 doTypeCompleters = (tree, ctx) ->
 
 	tree.ctx = ctx
@@ -650,7 +848,7 @@ doStatementCompleters = (tree, ctx) ->
 
 	else
 		doTermCompleters(tree, ctx)  # assume anything else is a term
-
+###
 
 ### TYPE COMPARISONS ###
 

@@ -442,6 +442,18 @@ July 13.
 
 	[Current assumption: The lower bound of a type declaration is also a type assignment.]
 
-	
+	The next implementation task will distinguish between "fresh" contexts and "enclosing" contexts.
+	A fresh context is always associated with a type tree.
+	The enclosing context of an ID/id is the context that defines the ID/id.
+
+	When entering a type expression (during tree traversal), a fresh context is created.
+	When entering a statement block, the enclosing context is set to the current-fresh context.
+
+	The following items have a one-to-one correspondence with each other:
+	- enclosing context
+	- top-level type expression
+	- self reference
+
+
 
 ###
