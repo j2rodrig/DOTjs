@@ -14,7 +14,11 @@ window.compile = (input, stopAfter) ->
 			return ast.stringify(0)
 
 
-		contextify(ast, createPredefTree(), ast)
+		enclosing = createPredefTree()
+		fresh = ast
+		contextify(ast, enclosing, fresh)
+		output = genProgram(ast)
+
 
 		###
 		predefCtx = createPredefContext()   # create a context for predefined types
@@ -26,6 +30,7 @@ window.compile = (input, stopAfter) ->
 		outputBuffer.push(";")
 		output = outputBuffer.join("")
 		###
+
 
 		allOutput = [output]
 		if channels[types] then allOutput.push("/** Types log:\n\n" + channels[types].join("\n") + "\n**/")
@@ -124,55 +129,26 @@ derivedAssignment = (t, guard1, lhs1, rhs1) ->
 		t1.rhs = rhs1
 		t1
 
-derivedConstruction = (t, typTree) ->
-	if t.typTree is typTree then t else
+derivedGuard = (t, condition) ->
+	if t.condition is condition then t else
 		t1 = shallowCopyTree(t)
-		t1.typTree = typTree
+		t1.condition = condition
 		t1
 
-simplifyType = (tree) ->
-
-	if tree.type is "TYPE-BOUNDS"   # TODO: we don't have an explicit "TYPE-BOUNDS" type anymore. When we decide to simplify types, redo this.
-		tree2 = derivedTypeBounds(tree, simplifyType(tree.lower), simplifyType(tree.upper))
-		if tree2.lower is tree2.upper   # if bounds are equivalent, then just return one of them
-			tree2.lower
-		else
-			tree2
-
-	else if tree.type is "AND-TYPE"
-		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
-		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
-			tree2.lhs
-		else if tree2.lhs is Nothing or tree2.rhs is Nothing   # intersection with Nothing === Nothing
-			Nothing
-		else if tree2.lhs is Any   # intersection with Any is redundant
-			tree2.rhs
-		else if tree2.rhs is Any
-			tree2.lhs
-		else
-			tree2
-
-	else if tree.type is "OR-TYPE"
-		tree2 = derivedAndOrType(tree, simplifyType(tree.lhs), simplifyType(tree.rhs))
-		if tree2.lhs is tree2.rhs       # if components are equivalent, then just return one of them
-			tree2.lhs
-		else if tree2.lhs is Any or tree2.rhs is Any   # union with Any === Any
-			Any
-		else if tree2.lhs is Nothing   # union with Nothing is redundant
-			tree2.rhs
-		else if tree2.rhs is Nothing
-			tree2.lhs
-		else
-			tree2
-
-	else
-		tree
+derivedConstruction = (t, guard, typTree) ->
+	if t.typTree is typTree and t.guard is guard then t else
+		t1 = shallowCopyTree(t)
+		t1.typTree = typTree
+		t1.guard = guard
+		t1
 
 # insideStatement is true if looking at a statement, false if looking at a base type tree
 deepCopyTree = (t, mutator, insideStatement) ->
 
 	#
-	# Do mutations of subtrees
+	# Do mutations of subtrees.
+	# We don't copy any Id trees here because they don't have subtrees. (Side Note: if we did copy Id trees, we would have to make sure the enclosing and definingTree members got copied.)
+	# Although technically allowed by syntax, we ignore guards on id and TERM-SELECT trees (because such guards are useless anyway).
 	#
 	t1 =
 		if t.type is "TYPE-SELECT" or t.type is "TERM-SELECT"
@@ -205,7 +181,7 @@ deepCopyTree = (t, mutator, insideStatement) ->
 			derivedTermDecl(t, rhs)
 
 		else if t.type is "TERM-ASSIGN"
-			guard1 = if t.guard then deepCopyTree(t.guard, mutator) else undefined
+			guard1 = if t.guard then derivedGuard(t.guard, deepCopyTree(t.guard.condition, mutator)) else undefined
 			lhs1 = if t.lhs.type is "id"   # don't do mutation of assignment LHS if we're doing member initialization
 				t.lhs
 			else
@@ -214,73 +190,15 @@ deepCopyTree = (t, mutator, insideStatement) ->
 			derivedAssignment(t, guard1, lhs1, rhs1)
 
 		else if t.type is "CONSTRUCT"
+			guard1 = if t.guard then derivedGuard(t.guard, deepCopyTree(t.guard.condition, mutator)) else undefined
 			typTree1 = deepCopyTree(t.typTree, mutator, false)
-			derivedConstruction(t, typTree1)
+			derivedConstruction(t, guard1, typTree1)
 
 		else
 			t
 
 	mutator(t1, insideStatement)
 
-replaceContextWithPrefix = (typ, ctx, prefix) ->
-	deepCopyTree(typ, (t, insideStatement) ->
-		#
-		# For every id and ID that is defined in the given context, turn it into a select with the given prefix.
-		# We need to transform prefix-less identifiers only, since only identifiers are implicitly understood
-		# to be prefixed with a self-reference.
-		#
-		if t.type is "ID"
-			startCtx = if insideStatement then t.ctx else t.ctx.outer   # if we're inside a statement, look up in the current context, otherwise enclosing context
-			if getDefContext(t.match, startCtx) is ctx
-				t1 = shallowCopyTree(t)
-				t1.type = "TYPE-SELECT"
-				t1.ID = t.match
-				t1.prefix = prefix
-				t1.stringify = (indent) -> "#{t1.ID}.#{t1.prefix.stringify(indent)}"
-				return t1
-		if t.type is "id"
-			startCtx = if insideStatement then t.ctx else t.ctx.outer
-			if getDefContext(t.match, startCtx) is ctx
-				t1 = shallowCopyTree(t)
-				t1.type = "TERM-SELECT"
-				t1.id = t.match
-				t1.prefix = prefix
-				t1.stringify = (indent) -> "#{t1.id}.#{t1.prefix.stringify(indent)}"
-				return t1
-		t
-	)
-
-
-replaceContextWithContext = (typ, fromCtx, toCtx) ->
-	deepCopyTree(typ, (t, insideStatement) ->
-		#
-		# For every id and ID that is defined in fromCtx, make a copy of it in toCtx.
-		# We need to replace the contexts of prefix-less identifiers only, since only identifiers
-		# are implicitly understood to be prefixed with a self-reference.
-		#
-		if t.type is "ID"
-			startCtx = if insideStatement then t.ctx else t.ctx.outer   # if we're inside a statement, look up in the current context, otherwise enclosing context
-			if getDefContext(t.match, startCtx) is fromCtx
-				t1 = shallowCopyTree(t)
-				t1.type = "ID"
-				t1.ctx = toCtx
-				t1.match = t.match
-				t1.stringify = (indent) -> "#{t1.match}"
-				return t1
-		if t.type is "id"
-			startCtx = if insideStatement then t.ctx else t.ctx.outer
-			if getDefContext(t.match, startCtx) is fromCtx
-				t1 = shallowCopyTree(t)
-				t1.type = "id"
-				t1.ctx = toCtx
-				t1.match = t.match
-				t1.stringify = (indent) -> "#{t1.match}"
-				return t1
-		t
-	)
-
-
-### CONTEXTS AND SYMBOL/MEMBER LOOKUP ###
 
 createPredefTree = () ->
 	predefTree =
@@ -300,306 +218,6 @@ createPredefTree = () ->
 	)
 	predefTree
 
-
-###
-createPredefContext = () ->
-	predefTree = createPredefTree()
-	ctx = freshContext(undefined, predefTree)
-	ctx.outer = ctx  # circular reference to outermost context (for convenience)
-	Any.ctx = ctx   # hack: make the contexts of predefined types point to the predef context
-	Nothing.ctx = ctx
-	ctx
-###
-
-###
-freshContext = (outer, typTree) ->
-	ctx = {}
-
-	if outer
-		ctx.nestLevel = outer.nestLevel + 1
-		ctx.outer = outer
-	else
-		ctx.nestLevel = 0
-		ctx.outer = undefined
-
-	ctx.indents = tabs(ctx.nestLevel)
-
-	ctx.name = "c#{ctx.nestLevel}"
-
-	ctx.fresh = (typTree) -> freshContext(ctx, typTree)
-
-	ctx.findMember = (name, returnLowerBound, logIndent) ->
-		# Find the actual statement blocks that define the members of this context.
-		asConstructed = typeAsConstructed(typTree, ctx.outer)
-		# Unlike the above, the context for the call to findMember is undefined.
-		# Since the asConstructed tree no longer includes names of base types, the context is never referenced, so we don't pass one.
-		findMember(name, asConstructed, undefined, returnLowerBound, logIndent)
-
-	ctx
-
-findMember = (name, typTree, ctx, returnLowerBound, logIndent) ->  # params: name to find, type tree to look into, enclosing context to resolve type/term names in the type tree
-
-	if typTree.type is "STATEMENTS"
-		found = undefined
-		for st in typTree.statements
-			if st.type is "TYPE-DECL" and st.lhs.match is name
-				if found then throw new Error("Duplicate definition of '#{name}' on line #{st.lhs.line} character #{st.lhs.column}")
-				found = if returnLowerBound then st.rhsLower else st.rhsUpper
-			else if st.type is "TERM-DECL" and st.lhs.match is name
-				if found then throw new Error("Duplicate definition of '#{name}' on line #{st.lhs.line} character #{st.lhs.column}")
-				found = st.rhs
-		found
-
-	else if typTree.type is "ANY"
-		undefined
-
-	else if typTree.type is "NOTHING"
-		throw new Error("Attempt to find member '#{name}' in type Nothing, which contains contradictory definitions of '#{name}'.")
-		# Note on Nothing: (July 2, 2016)
-		#   Nothing contains all possible members, which means that for any given name,
-		# Nothing contains contradictory definitions. Since we can't return anything sensical,
-		# we throw an exception.
-		#   There is the possibility of a type that contains contradictory definitions for
-		# some names, but not for others. For example, the ReadonlyNothing type would return
-		# a result for the mutability member, but not for other members.
-
-	else if typTree.type is "ID"
-		[widenedIdCtx, widenedIdTree] = widen(typTree, ctx)
-		findMember(name, widenedIdTree, widenedIdCtx, returnLowerBound)
-
-	else if typTree.type is "TYPE-SELECT"
-		[widenedCtx, widenedTyp] = widen(typTree, ctx)
-		findMember(name, widenedTyp, widenedCtx, returnLowerBound)
-
-	else if typTree.type is "AND-TYPE"
-		lhsType = findMember(name, typTree.lhs, ctx, returnLowerBound)
-		rhsType = findMember(name, typTree.rhs, ctx, returnLowerBound)
-		if (not lhsType) or (lhsType is rhsType)
-			rhsType
-		else if not rhsType
-			lhsType
-		else if returnLowerBound
-			OrType(lhsType, rhsType)
-		else
-			AndType(lhsType, rhsType)
-
-	else
-		throw new Error("Internal compiler error: Unexpected #{typTree.type} tree in findMember")
-
-# Widen a term or named type to its corresponding type tree.
-# For named types or terms, returns the given context.
-# For constructors, returns the context for that constructor itself.
-widen = (tree, ctx, returnLowerBound, logIndent = 0) ->
-
-	if tree.type is "id"
-		log(types, tabs(logIndent) + "Widening #{tree.match} to its declared type" + (if returnLowerBound then " (getting lower bound)" else ""))
-		typ = requireMemberInContext(tree.match, ctx, tree, returnLowerBound, logIndent+1)
-		#
-		# Replace the expanded type's original context with the current context.
-		# Identifiers referring to the original context will now refer to the current context.
-		#
-		log(types, "Replacing context #{typ.ctx.name} with context #{ctx.name}")
-		typ = replaceContextWithContext(typ, typ.ctx, ctx)
-		log(types, "Result: " + typ.stringify(0))
-
-		#ctx = requireDefContext(tree.match, ctx, tree)  #TODO: do we want this?
-		[ctx, typ]
-
-	else if tree.type is "ID"
-		log(types, tabs(logIndent) + "Widening #{tree.match} to its declared type" + (if returnLowerBound then " (getting lower bound)" else ""))
-		typ = requireMemberInContext(tree.match, ctx, tree, returnLowerBound, logIndent+1)
-		#
-		# Replace the expanded type's original context with the current context.
-		# Replacing the context makes the returned type look as if it were declared right here; as if the named ID was replaced directly with the expansion.
-		#
-		log(types, "Replacing context #{typ.ctx.name} with context #{ctx.name}")
-		typ = replaceContextWithContext(typ, typ.ctx, ctx)
-		log(types, "Result: " + typ.stringify(0))
-
-		#ctx = requireDefContext(tree.match, ctx, tree)  #TODO: do we want this?
-		[ctx, typ]
-
-	else if tree.type is "TERM-SELECT"
-		log(types, tabs(logIndent) + "Widening term selection #{tree.stringify(logIndent+1)} to its declared type" + (if returnLowerBound then " (getting lower bound)" else ""))
-		[prefixCtx, prefixTyp] = widen(tree.prefix, ctx, false, logIndent+1)
-		typ = requireMemberInType(tree.id, prefixTyp, prefixCtx, tree, returnLowerBound)
-		#
-		# Replace the expanded type's original context with the current prefix.
-		# Replacing the context makes the returned type look as if it were declared right here; as if the named ID was replaced directly with the expansion.
-		#
-		log(types, "Replacing context #{typ.ctx.name} with prefix #{tree.prefix.stringify(0)}")
-		typ = replaceContextWithPrefix(typ, typ.ctx, tree.prefix)
-		log(types, "Result: " + typ.stringify(0))
-
-		[prefixCtx, typ]
-
-	else if tree.type is "TYPE-SELECT"
-		log(types, tabs(logIndent) + "Widening type selection #{tree.stringify(logIndent+1)} to its declared type" + (if returnLowerBound then " (getting lower bound)" else ""))
-		[prefixCtx, prefixTyp] = widen(tree.prefix, ctx, false, logIndent+1)
-		typ = requireMemberInType(tree.ID, prefixTyp, prefixCtx, tree, returnLowerBound)
-		#
-		# Replace the expanded type's original context with the current prefix.
-		# Replacing the context makes the returned type look as if it were declared right here; as if the named ID was replaced directly with the expansion.
-		#
-		log(types, "Replacing context #{typ.ctx.name} with prefix #{tree.prefix.stringify(0)}")
-		typ = replaceContextWithPrefix(typ, typ.ctx, tree.prefix)
-		log(types, "Result: " + typ.stringify(0))
-
-		[prefixCtx, typ]
-
-	else if tree.type is "CONSTRUCT"
-		log(types, tabs(logIndent) + "Widening object #{tree.stringify(logIndent+1)} to its type-as-constructed")
-		asConstructed = typeAsConstructed(tree.typTree, ctx)
-		[tree.typTree.ctx, asConstructed]  # context is context of self-type
-
-	else
-		throw new Error("Unexpected #{tree.type} tree in widen")
-
-
-findMemberInContext = (name, ctx, returnLowerBound, logIndent) ->
-	found = ctx.findMember(name, returnLowerBound, logIndent)
-	if found
-		found
-	else if ctx isnt ctx.outer
-		findMemberInContext(name, ctx.outer, returnLowerBound, logIndent)
-	else
-		undefined
-
-# Finds the context that defines the given name, if it is in ctx or enclosing.
-getDefContext = (name, ctx) ->
-	if ctx.findMember(name)
-		ctx
-	else if ctx isnt ctx.outer
-		getDefContext(name, ctx.outer)
-	else
-		undefined
-
-# Throws an error if the given name is not defined in the given or enclosing contexts.
-requireMemberInContext = (name, ctx, sourceTree, returnLowerBound, logIndent) ->
-	typTree = findMemberInContext(name, ctx, returnLowerBound, logIndent)
-	if not typTree
-		throw new Error("Name '#{name}' is not defined at line #{sourceTree.line} character #{sourceTree.column}")
-	typTree
-
-requireMemberInType = (name, typTree, ctx, sourceTree, returnLowerBound, logIndent) ->
-	found = findMember(name, typTree, ctx, returnLowerBound, logIndent)
-	if not found
-		throw new Error("Member '#{name}' at line #{sourceTree.line} character #{sourceTree.column} could not be found")
-	found
-
-requireDefContext = (name, ctx, sourceTree) ->
-	found = getDefContext(name, ctx)
-	if not found
-		throw new Error("Name '#{name}' is not defined at line #{sourceTree.line} character #{sourceTree.column}")
-	found
-###
-
-
-### BASE/CONSTRUCTOR TYPE QUERIES ###
-
-###
-typeAsConstructed = (tree, ctx) ->
-	[bases, problemBase, stmts] = linearizedForConstruction(tree, ctx)
-	if bases is false
-		throw new Error("Cannot construct object at line #{tree.line} character #{tree.column} because base type #{problemBase.stringify(0)} is non-constructible.")
-	typ = Any
-	for stmt in stmts
-		if typ is Any
-			typ = stmt
-		else
-			typ = AndType(typ, stmt)
-	typ
-
-typeAsLinearized = (tree, ctx) ->
-	[bases, problemBase, stmts] = linearizedForConstruction(tree, ctx)
-	if bases is false
-		throw new Error("Cannot construct object at line #{tree.line} character #{tree.column} because base type #{problemBase.stringify(0)} is non-constructible.")
-	typ = Any
-	for base in bases
-		if typ is Any
-			typ = base
-		else
-			typ = AndType(typ, base)
-	typ
-
-# Finds the sequence of base types needed to construct an object of the given type tree.
-# Returns a triple [lin, base, statements].
-#   If the type is constructible, lin is an array of base types. If not, lin is false and base is the base type that cannot be constructed.
-#   statements is the list of statement blocks that contain member definitions.
-linearizedForConstruction = (tree, ctx) ->
-
-	if tree._linearization
-		return [tree._linearization, undefined, tree._statements]
-	else
-		tree._linearization = []
-		tree._statements = []
-
-	if tree.type in ["ID", "TYPE-SELECT"]
-		tree._linearization.push tree
-
-		# Make sure we can linearize higher base classes
-		[wCtx, wTyp] = widen(tree, ctx, true)
-		[lin, ignore, stmt] = linearizedForConstruction(wTyp, wCtx)
-		if lin is false
-			tree._linearization = false
-			return [false, tree, undefined]
-		tree._statements = tree._statements.concat stmt
-
-	else if tree.type is "AND-TYPE"
-		[linLhs, baseLhs, stmtLhs] = linearizedForConstruction(tree.lhs, ctx)
-		if linLhs is false
-			tree._linearization = false
-			return [false, baseLhs, undefined]
-
-		[linRhs, baseRhs, stmtRhs] = linearizedForConstruction(tree.rhs, ctx)
-		if linRhs is false
-			tree._linearization = false
-			return [false, baseRhs, undefined]
-
-		tree._linearization = tree._linearization.concat linLhs
-		tree._statements = tree._statements.concat stmtLhs
-		tree._linearization = tree._linearization.concat linRhs
-		tree._statements = tree._statements.concat stmtRhs
-
-	else if tree.type is "OR-TYPE"
-		# Here, we've got to choose which branch of the OrType gets instantiated.
-		# The default policy I go with here is to select the leftmost branch unless it is non-constructible.
-		# By choosing the leftmost branch, members of types earlier in the linearization order override members later in the order.
-		# The result of this policy is that declarations are narrowed from right to left, but assignments are executed from
-		#  left to right. This allows the most specific declarations and the earliest-executed terms to be grouped together
-		#  in the leftmost base type.
-		log(types, "Considering OrType #{tree.stringify(0)}")
-		[linLhs, baseLhs, stmtLhs] = linearizedForConstruction(tree.lhs, ctx)
-		if linLhs is false
-			[linRhs, baseRhs, stmtRhs] = linearizedForConstruction(tree.rhs, ctx)
-			if linRhs is false
-				tree._linearization = false
-				return [false, baseRhs, undefined]
-			tree._linearization = tree._linearization.concat linRhs
-			tree._statements = tree._statements.concat stmtRhs
-		else
-			tree._linearization = tree._linearization.concat linLhs
-			tree._statements = tree._statements.concat stmtLhs
-
-	else if tree.type is "NOTHING"
-		tree._linearization = false
-		return [false, tree, undefined]
-
-	else if tree.type is "STATEMENTS"
-		tree._linearization.push tree
-		tree._statements.push tree
-
-	else if tree.type is "ANY"
-		# No action needed
-
-	else
-		throw new Error("Internal compiler error: Expected a type tree in linearizedForConstruction, got #{tree.type} tree")
-
-	#TODO: remove duplicates?
-	[tree._linearization, undefined, tree._statements]
-###
-
-### CONTEXTIFY ###
 
 findMember = (name, typTree, lowerBound) ->
 
@@ -646,15 +264,61 @@ findMember = (name, typTree, lowerBound) ->
 		undefined
 
 	else if typTree.type is "NOTHING"
-		throw new Error("Attempt to find member '#{name}' in type Nothing, which contains contradictory definitions of '#{name}'.")
+		throw new Error("Attempt to find member '#{name}' in type Nothing on line #{typTree.line} character #{typTree.column}, which contains contradictory definitions of '#{name}'.")
 
 	else
 		throw new Error("Internal compiler error: Expected a type tree in findMember(\"#{name}\"), got '#{typTree.type}' tree")
 
-asConstructed = (typTree) ->  # takes any type and returns a constructible version without OrTypes
-	# TODO: complete
-	# TODO: memoize the result so that results from different calls are known to be equivalent
-	typTree
+containsBase = (typTree, base) ->  # tests whether an as-constructed type tree contains the given base tree
+
+	if typTree is base
+		true
+	else if typTree.type is "AND-TYPE"
+		containsBase(typTree.lhs, base) or containsBase(typTree.rhs, base)
+	else if typTree.type in ["STATEMENTS", "ANY", "NOTHING", "ID", "TYPE-SELECT"]
+		false
+	else
+		throw new Error("Internal compiler error: Expected a fully-expanded type tree in containsBase, got '#{typTree.type}' tree")
+
+# Takes any type and returns a constructible version without OrTypes. expandName is a boolean function 
+condenseBasesForConstruction = (typTree, expandName) ->
+
+	if typTree.type in ["STATEMENTS", "ANY", "NOTHING"]
+		typTree
+
+	else if typTree.type is "ID" or typTree.type is "TYPE-SELECT"
+		if expandName(typTree)
+			expanded = requireMember(typTree, true)
+			condenseBasesForConstruction(expanded, expandName)
+		else
+			typTree
+
+	else if typTree.type is "AND-TYPE"
+		AndType(condenseBasesForConstruction(typTree.lhs, expandName), condenseBasesForConstruction(typTree.rhs, expandName))
+
+	else if typTree.type is "OR-TYPE"
+		lhsExpanded = condenseBasesForConstruction(typTree.lhs, (t) -> true)   # find the fully-expanded set of base types. Do not memoize!
+		if containsBase(lhsExpanded, Nothing)
+			condenseBasesForConstruction(typTree.rhs, expandName)   # use right-hand side if left-hand side contains Nothing
+		else
+			condenseBasesForConstruction(typTree.lhs, expandName)   # otherwise, use left-hand side
+
+	else
+		throw new Error("Internal compiler error: Expected a type tree in condenseBasesForConstruction, got '#{typTree.type}' tree")
+
+# Takes any type and returns a constructible version without OrTypes. Memoized.
+asConstructed = (typTree) ->
+	if not typTree.asConstructed
+		typTree.asConstructed = condenseBasesForConstruction(typTree, (t) -> false)
+	typTree.asConstructed
+
+# Takes any type and returns a constructible version without OrTypes. All named types are expanded to their definitions. Memoized.
+fullyInlined = (typTree) ->
+	if not typTree.fullyInlined
+		typTree.fullyInlined = condenseBasesForConstruction(typTree, (t) -> true)
+	typTree.fullyInlined
+
+
 
 requireMember = (nameTree, lowerBound) ->
 
@@ -662,10 +326,12 @@ requireMember = (nameTree, lowerBound) ->
 		if nameTree.type is "id" or nameTree.type is "ID"
 			typ = undefined
 			enclosing = nameTree.enclosing
-			while enclosing and not typ
-				typ = findMember(nameTree.match, enclosing, lowerBound)
+			while enclosing
+				typ = findMember(nameTree.match, asConstructed(enclosing), lowerBound)
+				if typ
+					nameTree.definingTree = enclosing   # remember which type tree actually defines this name (important for type unpacking)
+					break
 				enclosing = enclosing.enclosing
-			nameTree.definingTree = enclosing   # remember which type tree actually defines this name (important for type unpacking)
 			typ
 
 		else if nameTree.type is "TYPE-SELECT"
@@ -716,36 +382,9 @@ replaceSelfWithPrefix = (typ, enclosing, prefix) ->
 				return t1
 		t
 	)
-	###
-	deepCopyTree(typ, (t, insideStatement) ->
-		#
-		# For every id and ID that is defined in the given context, turn it into a select with the given prefix.
-		# We need to transform prefix-less identifiers only, since only identifiers are implicitly understood
-		# to be prefixed with a self-reference.
-		#
-		if t.type is "ID"
-			startCtx = if insideStatement then t.ctx else t.ctx.outer   # if we're inside a statement, look up in the current context, otherwise enclosing context
-			if getDefContext(t.match, startCtx) is ctx
-				t1 = shallowCopyTree(t)
-				t1.type = "TYPE-SELECT"
-				t1.ID = t.match
-				t1.prefix = prefix
-				t1.stringify = (indent) -> "#{t1.ID}.#{t1.prefix.stringify(indent)}"
-				return t1
-		if t.type is "id"
-			startCtx = if insideStatement then t.ctx else t.ctx.outer
-			if getDefContext(t.match, startCtx) is ctx
-				t1 = shallowCopyTree(t)
-				t1.type = "TERM-SELECT"
-				t1.id = t.match
-				t1.prefix = prefix
-				t1.stringify = (indent) -> "#{t1.id}.#{t1.prefix.stringify(indent)}"
-				return t1
-		t
-	)
-	###
 
-contextify = (currentTree, enclosingTree, freshTree) ->
+
+contextify = (tree, enclosingTree, freshTree) ->
 
 	if tree.type is "STATEMENTS"
 		freshTree.enclosing = enclosingTree  # allow lookup into outer contexts
@@ -759,16 +398,18 @@ contextify = (currentTree, enclosingTree, freshTree) ->
 			else if st.type is "TYPE-ASSIGN"
 				contextify(st.rhs, enclosingTree, st.rhs)   # we have a fresh type on the right-hand side
 			else if st.type is "TERM-ASSIGN"
-				if st.guard then contextify(st.guard, enclosingTree, freshTree)
+				if st.guard then contextify(st.guard.condition, enclosingTree, freshTree)
 				contextify(st.lhs, enclosingTree, freshTree)
 				contextify(st.rhs, enclosingTree, freshTree)
 			else
-				throw new Error("Internal compiler error: Unexpected '#{tree.type}' tree in statement block")
+				contextify(st, enclosingTree, freshTree)
 
 	else if tree.type is "ID" or tree.type is "id"
-		currentTree.enclosing = enclosingTree
+		if tree.guard then contextify(tree.guard.condition, enclosingTree, freshTree)
+		tree.enclosing = enclosingTree
 
 	else if tree.type is "TYPE-SELECT" or tree.type is "TERM-SELECT"
+		if tree.guard then contextify(tree.guard.condition, enclosingTree, freshTree)
 		contextify(tree.prefix, enclosingTree, freshTree)
 
 	else if tree.type is "AND-TYPE" or tree.type is "OR-TYPE"
@@ -776,79 +417,12 @@ contextify = (currentTree, enclosingTree, freshTree) ->
 		contextify(tree.rhs, enclosingTree, freshTree)
 
 	else if tree.type is "CONSTRUCT"
+		if tree.guard then contextify(tree.guard.condition, enclosingTree, freshTree)
 		contextify(tree.typTree, enclosingTree, tree.typTree)   # new fresh type tree
 
 	else
 		throw new Error("Internal compiler error: Unexpected '#{tree.type}' tree in contextify")
 
-
-### LAZY INFO FUNCTIONS ... TODO: Do we really need these? ###
-
-###
-doTypeCompleters = (tree, ctx) ->
-
-	tree.ctx = ctx
-
-	if tree.type is "STATEMENTS"
-		for st in tree.statements
-			doStatementCompleters(st, tree.ctx)
-
-	else if tree.type is "ID"
-		# TODO?
-
-	else if tree.type is "TYPE-SELECT"
-		doTermCompleters(tree.prefix, ctx)
-
-	else if tree.type is "AND-TYPE" or tree.type is "OR-TYPE"
-		doTypeCompleters(tree.lhs, ctx)
-		doTypeCompleters(tree.rhs, ctx)
-
-	else
-		throw new Error("Unexpected #{tree.type} tree in doTypeCompleters")
-
-
-doTermCompleters = (tree, ctx) ->
-
-	if tree.type is "id"
-		tree.info = () ->
-			requireMemberInContext(tree.match, ctx, tree)
-
-	else if tree.type is "TERM-SELECT"
-		tree.info = () ->
-			requireMemberInType(tree.id, tree.prefix.info(), ctx, tree)
-		doTermCompleters(tree.prefix, ctx)
-
-	else if tree.type is "CONSTRUCT"
-		ctx = ctx.fresh(tree.typTree)
-		# Note on info() functions: The invariant of info() is that it always returns a type tree (not a statement or a term).
-		# There are at least two variants on info(): return the type tree as-is, or return a STATEMENTS tree containing linearized declarations.
-		#  (We do the former here.)
-		tree.info = () ->
-			tree.typTree
-		doTypeCompleters(tree.typTree, ctx)
-
-	else
-		throw new Error("Unexpected #{tree.type} tree in doTermCompleters")
-
-doStatementCompleters = (tree, ctx) ->
-	if tree.type is "TERM-DECL"
-		doTypeCompleters(tree.rhs, ctx)
-
-	else if tree.type is "TYPE-DECL"
-		doTypeCompleters(tree.rhsLower, ctx.fresh(tree.rhsLower))
-		doTypeCompleters(tree.rhsUpper, ctx.fresh(tree.rhsUpper))
-
-	else if tree.type is "TYPE-ASSIGN"
-		doTypeCompleters(tree.lhs, ctx)
-		doTypeCompleters(tree.rhs, ctx)
-
-	else if tree.type is "TERM-ASSIGN"
-		doTermCompleters(tree.lhs, ctx)
-		doTermCompleters(tree.rhs, ctx)
-
-	else
-		doTermCompleters(tree, ctx)  # assume anything else is a term
-###
 
 ### TYPE COMPARISONS ###
 
@@ -975,118 +549,114 @@ requireTermCompatibility = (tree0, tree1, ctx) ->
 
 ### CODEGEN ###
 
-gen = (tree, ctx, indent, output) ->
+genProgram = (ast) ->
 
-	# On statement ordering
+	# Create a unique-identifier counter
+	uniqueId = -1
+	getId = () ->
+		uniqueId += 1
+		uniqueId
 
-	if tree.type is "STATEMENTS"
-		for st in tree.statements
+	# Generate a constructor for the entire program.
+	output = []
+	genCtor(ast, true, getId, 0, output)
+	output.push(";")  # an unnecessary semicolon to make the output look more complete
+	output.join("")
+
+genBaseCalls = (base, fresh, getId, indent, output) ->
+	if base.type is "STATEMENTS"
+		# hoist type-member initializers to top of statement block
+		for st in base.statements
 			if st.type is "TYPE-DECL"
-				[bases, baseWithProblem] = linearizedForConstruction(st.rhsLower, ctx)
-				if bases  # skip generating an initializer if the type is non-constructible
-					output.push(tabs(indent))
-					defCtx = requireDefContext(st.lhs.match, ctx, tree)
-					output.push("if(!#{defCtx.name}.#{st.lhs.match}){")  # define an initializer only if a same-named initializer has not been defined yet
-					output.push("#{defCtx.name}.#{st.lhs.match}")
-					output.push(" = ")
-					genInitializer(bases, st.rhsLower.ctx, ctx, indent, output)
-					output.push(";}\n")
-
-		for st in tree.statements
+				genTypeInitializer(fresh, st.lhs.match, st.rhsLower, getId, indent + 1, output)
+		# generate executable terms
+		for st in base.statements
 			if st.type is "TERM-ASSIGN"
-				requireTermCompatibility(st.rhs, st.lhs, ctx)  # Check for rhs <: lhs compatibility
-				output.push(tabs(indent))
-				if st.guard
-					output.push("if(")
-					gen(st.guard.condition, ctx, indent, output)
-					output.push("){ ")
-				gen(st.lhs, ctx, indent, output)
+				output.push(tabs(indent + 1))
+				maybeGenGuard(st, getId, indent + 1, output)
+				gen(st.lhs, getId, indent + 1, output)
 				output.push(" = ")
-				gen(st.rhs, ctx, indent, output)
-				if st.guard
-					output.push(" }")
+				gen(st.rhs, getId, indent + 1, output)
 				output.push(";\n")
 			else if st.type in ["id", "TERM-SELECT", "CONSTRUCT"]
-				output.push(tabs(indent))
-				if st.guard
-					output.push("if(")
-					gen(st.guard.condition, ctx, indent, output)
-					output.push("){ ")
-				gen(st, ctx, indent, output)
-				if st.guard
-					output.push(" }")
+				output.push(tabs(indent + 1))
+				maybeGenGuard(st, getId, indent + 1, output)
+				gen(st, getId, indent + 1, output)
 				output.push(";\n")
-			else
-				if st.guard
-					throw new Error("Unexpected guard on #{st.type} statement on line #{st.guard.line}")
+	else if base.type is "ID"
+		if base.match isnt "Any"
+			requireMember(base, true)  # make sure definingTree is set
+			selfName = base.definingTree.selfName
+			output.push(tabs(indent + 1))
+			output.push("#{selfName}.#{base.match}(#{fresh.selfName});\n")
+	else if base.type is "TYPE-SELECT"
+		output.push(tabs(indent + 1))
+		gen(base.prefix, getId, indent + 1, output)
+		output.push(".#{base.ID}(#{fresh.selfName});\n")
+	else if base.type is "AND-TYPE"
+		genBaseCalls(base.lhs, fresh, getId, indent, output)
+		genBaseCalls(base.rhs, fresh, getId, indent, output)
+	else if base.type is "ANY"
+		# don't need to do anything with Any
+	else
+		throw new Error("Internal compiler error: Unexpected base type tree #{base.type} in genBaseCalls. Line #{base.line} character #{base.column}")
 
-	else if tree.type is "CONSTRUCT"
-		[bases, baseWithProblem] = linearizedForConstruction(tree.typTree, ctx)
-		if bases is false
-			throw new Error("Cannot construct the object at line #{tree.line} character #{tree.column} because base type '#{baseWithProblem.stringify(0)}' is non-constructible.")
-		genConstructor(bases, tree.typTree.ctx, ctx, indent, output)
+maybeGenGuard = (tree, getId, indent, output) ->
+	if tree.guard
+		output.push("if (")
+		gen(guard.condition, getId, indent, output)
+		output.push(") ")
 
-	else if tree.type is "id"
-		if tree.match is "???"
-			output.push("(function(){ throw new Error('Not Implemented'); })()")
-		else
-			defCtx = requireDefContext(tree.match, ctx, tree)
-			output.push("#{defCtx.name}.#{tree.match}")
+genCtor = (tree, isConcrete, getId, indent, output) ->
+
+	# assign a unique name for this tree's self-reference
+	tree.selfName = "self" + getId()
+
+	cType = asConstructed(tree)
+	cannotBeNothing = if isConcrete then fullyInlined(cType) else cType
+	if containsBase(cannotBeNothing, Nothing)
+		throw new Error("Error: Attempt to initialize an object with a base type of Nothing on line #{tree.line} character #{tree.column}")
+
+	if isConcrete then output.push("(")
+	output.push("function(#{tree.selfName}){\n")
+	genBaseCalls(cType, tree, getId, indent, output)
+	output.push(tabs(indent + 1))
+	output.push("return #{tree.selfName};\n")
+	output.push(tabs(indent))
+	output.push("}")
+	if isConcrete then output.push(")({})")
+
+# Generate a type initializer call. fresh is the type tree containing the type name, typTree defines the bases called by the initializer.
+genTypeInitializer = (fresh, name, typTree, getId, indent, output) ->
+
+	if not containsBase(asConstructed(typTree), Nothing)  # don't bother generating if we would definitely be constructing Nothing
+
+		output.push(tabs(indent))
+		output.push("if(!#{fresh.selfName}.#{name}){")  # define an initializer at runtime only if a same-named initializer has not been defined yet
+		output.push("#{fresh.selfName}.#{name}")
+		output.push(" = ")
+		genCtor(typTree, false, getId, indent, output)
+		output.push(";}\n")
+
+gen = (tree, getId, indent, output) ->
+
+	if tree.type is "id"
+		requireMember(tree, true)  # make sure definingTree is set
+		output.push(tree.definingTree.selfName)
+		output.push(".")
+		output.push(tree.match)
 
 	else if tree.type is "TERM-SELECT"
-		[prefixCtx, prefixType] = widen(tree.prefix, ctx)
-		requireMemberInType(tree.id, prefixType, prefixCtx, tree)  # Typecheck: make sure id exists in prefix type
-		gen(tree.prefix, ctx, indent, output)
+		gen(tree.prefix, getId, indent, output)
 		output.push(".")
 		output.push(tree.id)
 
-genInitializer = (bases, ctx, outer, indent, output) ->
-	# TODO: hoist type assignments?
-	output.push("function(#{ctx.name}){\n")
-	for base in bases
-		if base.type is "STATEMENTS"
-			gen(base, ctx, indent + 1, output)
-		else if base.type is "ID"
-			defCtx = requireDefContext(base.match, outer, base)
-			output.push(tabs(indent + 1))
-			output.push("#{defCtx.name}.#{base.match}(#{ctx.name});\n")
-		else if base.type is "TYPE-SELECT"
-			output.push(tabs(indent + 1))
-			gen(base.prefix, outer, indent + 1, output)
-			output.push(".#{base.ID}(#{ctx.name});\n")
-		else if base.type is "ANY"
-			# don't need to do anything with Any
-		else
-			throw new Error("Internal compiler error: Unexpected base type tree #{base.type} in genConstructor. Line #{tree.line} character #{tree.column}")
+	else if tree.type is "CONSTRUCT"
+		genCtor(tree.typTree, true, getId, indent, output)
 
-	output.push(tabs(indent + 1))
-	output.push("return #{ctx.name};\n")
-	output.push(tabs(indent))
-	output.push("}")
+	else
+		throw new Error("Internal compiler error: Expected term tree in gen function, got #{tree.type} tree")
 
-genConstructor = (bases, ctx, outer, indent, output) ->
-	output.push("(function(#{ctx.name}){\n")
-	for base in bases
-		if base.type is "STATEMENTS"
-			gen(base, ctx, indent + 1, output)
-		else if base.type is "ID"
-			if base.match isnt "Any"  # hack: don't generate constructor calls to the predefined type Any
-				defCtx = requireDefContext(base.match, outer, base)
-				output.push(tabs(indent + 1))
-				output.push("#{defCtx.name}.#{base.match}(#{ctx.name});\n")
-		else if base.type is "TYPE-SELECT"
-			output.push(tabs(indent + 1))
-			gen(base.prefix, outer, indent + 1, output)
-			output.push(".#{base.ID}(#{ctx.name});\n")
-		else if base.type is "ANY"
-			# don't need to do anything with Any
-		else
-			throw new Error("Internal compiler error: Unexpected base type tree #{base.type} in genConstructor. Line #{tree.line} character #{tree.column}")
-
-	output.push(tabs(indent + 1))
-	output.push("return #{ctx.name};\n")
-	output.push(tabs(indent))
-	output.push("})({})")
 
 
 ### PARSER ###
