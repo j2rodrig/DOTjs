@@ -330,7 +330,7 @@
         return void 0;
       }
     } else if (typTree.type === "CONSTRUCT") {
-      return findMember(name, asConstructed(typTree.typTree));
+      return findMember(name, fullyInlined(typTree.typTree));
     } else if (typTree.type === "ANY") {
       return void 0;
     } else if (typTree.type === "NOTHING") {
@@ -405,7 +405,7 @@
         typ = void 0;
         enclosing = nameTree.enclosing;
         while (enclosing) {
-          typ = findMember(nameTree.match, asConstructed(enclosing), lowerBound);
+          typ = findMember(nameTree.match, fullyInlined(enclosing), lowerBound);
           if (typ) {
             nameTree.definingTree = enclosing;
             break;
@@ -730,7 +730,7 @@
     if (isConcrete) {
       output.push("(");
     }
-    output.push("function(" + tree.selfName + "){\n");
+    output.push("function(" + tree.selfName + ") {\n");
     genBaseCalls(cType, tree, getId, indent, output);
     output.push(tabs(indent + 1));
     output.push("return " + tree.selfName + ";\n");
@@ -742,19 +742,20 @@
   };
 
   genTypeInitializer = function(fresh, name, typTree, getId, indent, output) {
-    if (!containsBase(asConstructed(typTree), Nothing)) {
+    if (!containsBase(fullyInlined(typTree), Nothing)) {
       output.push(tabs(indent));
-      output.push("if(!" + fresh.selfName + "." + name + "){");
+      output.push("if(!" + fresh.selfName + "." + name + ")\n");
+      output.push(tabs(indent + 1));
       output.push(fresh.selfName + "." + name);
       output.push(" = ");
-      genCtor(typTree, false, getId, indent, output);
-      return output.push(";}\n");
+      genCtor(typTree, false, getId, indent + 1, output);
+      return output.push(";\n");
     }
   };
 
   gen = function(tree, getId, indent, output) {
     if (tree.type === "id") {
-      requireMember(tree, true);
+      requireMember(tree);
       output.push(tree.definingTree.selfName);
       output.push(".");
       return output.push(tree.match);

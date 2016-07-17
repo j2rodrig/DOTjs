@@ -258,7 +258,7 @@ findMember = (name, typTree, lowerBound) ->
 			undefined  # at least one side does not define the name
 
 	else if typTree.type is "CONSTRUCT"
-		findMember(name, asConstructed(typTree.typTree))
+		findMember(name, fullyInlined(typTree.typTree))
 
 	else if typTree.type is "ANY"
 		undefined
@@ -327,7 +327,7 @@ requireMember = (nameTree, lowerBound) ->
 			typ = undefined
 			enclosing = nameTree.enclosing
 			while enclosing
-				typ = findMember(nameTree.match, asConstructed(enclosing), lowerBound)
+				typ = findMember(nameTree.match, fullyInlined(enclosing), lowerBound)
 				if typ
 					nameTree.definingTree = enclosing   # remember which type tree actually defines this name (important for type unpacking)
 					break
@@ -618,7 +618,7 @@ genCtor = (tree, isConcrete, getId, indent, output) ->
 		throw new Error("Error: Attempt to initialize an object with a base type of Nothing on line #{tree.line} character #{tree.column}")
 
 	if isConcrete then output.push("(")
-	output.push("function(#{tree.selfName}){\n")
+	output.push("function(#{tree.selfName}) {\n")
 	genBaseCalls(cType, tree, getId, indent, output)
 	output.push(tabs(indent + 1))
 	output.push("return #{tree.selfName};\n")
@@ -629,19 +629,20 @@ genCtor = (tree, isConcrete, getId, indent, output) ->
 # Generate a type initializer call. fresh is the type tree containing the type name, typTree defines the bases called by the initializer.
 genTypeInitializer = (fresh, name, typTree, getId, indent, output) ->
 
-	if not containsBase(asConstructed(typTree), Nothing)  # don't bother generating if we would definitely be constructing Nothing
+	if not containsBase(fullyInlined(typTree), Nothing)  # don't bother generating if we would definitely be constructing Nothing
 
 		output.push(tabs(indent))
-		output.push("if(!#{fresh.selfName}.#{name}){")  # define an initializer at runtime only if a same-named initializer has not been defined yet
+		output.push("if(!#{fresh.selfName}.#{name})\n")  # define an initializer at runtime only if a same-named initializer has not been defined yet
+		output.push(tabs(indent+1))
 		output.push("#{fresh.selfName}.#{name}")
 		output.push(" = ")
-		genCtor(typTree, false, getId, indent, output)
-		output.push(";}\n")
+		genCtor(typTree, false, getId, indent+1, output)
+		output.push(";\n")
 
 gen = (tree, getId, indent, output) ->
 
 	if tree.type is "id"
-		requireMember(tree, true)  # make sure definingTree is set
+		requireMember(tree)  # make sure definingTree is set
 		output.push(tree.definingTree.selfName)
 		output.push(".")
 		output.push(tree.match)
