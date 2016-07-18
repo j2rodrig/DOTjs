@@ -11,7 +11,7 @@ window.compile = (input, stopAfter) ->
 		ast = parse(tokens)
 
 		if stopAfter == "trees"
-			return ast.stringify(0)
+			return stringify(ast)
 
 
 		enclosing = createPredefTree()
@@ -19,17 +19,6 @@ window.compile = (input, stopAfter) ->
 		contextify(ast, enclosing, fresh)
 		output = genProgram(ast)
 
-
-		###
-		predefCtx = createPredefContext()   # create a context for predefined types
-		doTypeCompleters(ast, predefCtx.fresh(ast))   # generate subcontexts and info() functions
-
-		outputBuffer = []
-		[bases, ignore] = linearizedForConstruction(ast, predefCtx)
-		genConstructor(bases, ast.ctx, predefCtx, 0, outputBuffer)
-		outputBuffer.push(";")
-		output = outputBuffer.join("")
-		###
 
 
 		allOutput = [output]
@@ -74,13 +63,13 @@ AndType = (lhsTyp, rhsTyp) ->
 	type: "AND-TYPE"
 	lhs: lhsTyp
 	rhs: rhsTyp
-	stringify: (indent) -> lhsTyp.stringify(indent) + " & " + rhsTyp.stringify(indent)
+	stringify: (indent) -> stringify(lhsTyp, indent) + " & " + stringify(rhsTyp, indent)
 
 OrType = (lhsTyp, rhsTyp) ->
 	type: "OR-TYPE"
 	lhs: lhsTyp
 	rhs: rhsTyp
-	stringify: (indent) -> lhsTyp.stringify(indent) + " | " + rhsTyp.stringify(indent)
+	stringify: (indent) -> stringify(lhsTyp, indent) + " | " + stringify(rhsTyp, indent)
 
 
 ### TYPE OPERATIONS ###
@@ -108,16 +97,18 @@ derivedAndOrType = (tree, lhs, rhs) ->
 	else if tree.type is "OR-TYPE"
 		OrType(lhs, rhs)
 
-derivedTypeDecl = (t, rhsUpper, rhsLower) ->
-	if t.rhsUpper is rhsUpper and t.rhsLower is rhsLower then t else
+derivedTypeDecl = (t, lhs, rhsUpper, rhsLower) ->
+	if t.lhs is lhs and t.rhsUpper is rhsUpper and t.rhsLower is rhsLower then t else
 		t1 = shallowCopyTree(t)
+		t1.lhs = lhs
 		t1.rhsUpper = rhsUpper
 		t1.rhsLower = rhsLower
 		t1
 
-derivedTermDecl = (t, rhs) ->
-	if t.rhs is rhs then t else  #TODO: stringify?
+derivedTermDecl = (t, lhs, rhs) ->
+	if t.lhs is lhs and t.rhs is rhs then t else
 		t1 = shallowCopyTree(t)
+		t1.lhs = lhs
 		t1.rhs = rhs
 		t1
 
@@ -163,7 +154,6 @@ deepCopyTree = (t, mutator, insideStatement) ->
 				st1 = deepCopyTree(st, mutator, true)
 				if st1 isnt st then anyDifferent = true
 				stmt1.statements.push(st1)
-			stmt1.stringify = (indent) -> stringifyStatements(stmt1, indent)
 			if anyDifferent then stmt1 else t   # only return the copied tree if any subtrees are different
 
 		else if t.type is "AND-TYPE" or t.type is "OR-TYPE"
@@ -174,11 +164,11 @@ deepCopyTree = (t, mutator, insideStatement) ->
 		else if t.type is "TYPE-DECL"
 			rhsUpper = deepCopyTree(t.rhsUpper, mutator, false)
 			rhsLower = deepCopyTree(t.rhsLower, mutator, false)
-			derivedTypeDecl(t, rhsUpper, rhsLower)
+			derivedTypeDecl(t, t.lhs, rhsUpper, rhsLower)
 
 		else if t.type is "TERM-DECL"
 			rhs = deepCopyTree(t.rhs, mutator, false)
-			derivedTermDecl(t, rhs)
+			derivedTermDecl(t, t.lhs, rhs)
 
 		else if t.type is "TERM-ASSIGN"
 			guard1 = if t.guard then derivedGuard(t.guard, deepCopyTree(t.guard.condition, mutator)) else undefined
@@ -264,7 +254,11 @@ findMember = (name, typTree, lowerBound) ->
 		undefined
 
 	else if typTree.type is "NOTHING"
-		throw new Error("Attempt to find member '#{name}' in type Nothing on line #{typTree.line} character #{typTree.column}, which contains contradictory definitions of '#{name}'.")
+		# throw new Error("Attempt to find member '#{name}' in type Nothing on line #{typTree.line} character #{typTree.column}, which contains contradictory definitions of '#{name}'.")
+		# Don't generate any errors if findMember is called on Nothing.
+		# The logic here is this: Since Nothing contains contradictory definitions of the given name, we will assume
+		#  the programmer meant the name to refer to some enclosing scope.
+		undefined
 
 	else
 		throw new Error("Internal compiler error: Expected a type tree in findMember(\"#{name}\"), got '#{typTree.type}' tree")
@@ -319,8 +313,8 @@ fullyInlined = (typTree) ->
 	typTree.fullyInlined
 
 
-
-requireMember = (nameTree, lowerBound) ->
+# 
+lookupMember = (nameTree, lowerBound) ->
 
 	typTree =
 		if nameTree.type is "id" or nameTree.type is "ID"
@@ -330,6 +324,9 @@ requireMember = (nameTree, lowerBound) ->
 				typ = findMember(nameTree.match, fullyInlined(enclosing), lowerBound)
 				if typ
 					nameTree.definingTree = enclosing   # remember which type tree actually defines this name (important for type unpacking)
+					if typ.enclosing isnt enclosing
+						# replace all instances of (original-context) typ.enclosing with (current-context) enclosing.
+						typ = replaceSelfWithSelf(typ, typ.enclosing, enclosing)
 					break
 				enclosing = enclosing.enclosing
 			typ
@@ -337,52 +334,74 @@ requireMember = (nameTree, lowerBound) ->
 		else if nameTree.type is "TYPE-SELECT"
 			prefixTyp = requireMember(nameTree.prefix, false)
 			typ = findMember(nameTree.ID, prefixTyp, lowerBound)
-			typ = replaceSelfWithPrefix(typ, prefixTyp, nameTree.prefix)  # replace all Ids where nameTree.definingTree==prefixTyp with TypeSelect(prefix,ID)
+			typ = replaceSelfWithPrefix(typ, typ.enclosing, nameTree.prefix)  # replace all Ids where IdTree.definingTree==typ.enclosing with selection "prefix.Id"
 			typ
 
 		else if nameTree.type is "TERM-SELECT"
 			prefixTyp = requireMember(nameTree.prefix, false)
 			typ = findMember(nameTree.id, prefixTyp, lowerBound)
-			typ = replaceSelfWithPrefix(typ, prefixTyp, nameTree.prefix)  # replace all Ids where nameTree.definingTree==prefixTyp with TermSelect(prefix,id)
+			typ = replaceSelfWithPrefix(typ, typ.enclosing, nameTree.prefix)  # replace all Ids where IdTree.definingTree==typ.enclosing with selection "prefix.Id"
 			typ
 
 		else if nameTree.type is "CONSTRUCT"   # the "named" thing here is anonymous
 			nameTree  # return the constructor itself
 
 		else
-			throw new Error("Internal compiler error: Expected name tree in requireMember, got '#{nameTree.type}'")
+			throw new Error("Internal compiler error: Expected name tree in lookupMember, got '#{nameTree.type}'")
+
+requireMember = (nameTree, lowerBound) ->
+	typTree = lookupMember(nameTree, lowerBound)
 
 	if not typTree
-		throw new Error("Error: Unable to find type of '#{nameTree.stringify(0)}' on line #{nameTree.line} character #{nameTree.column}")
+		throw new Error("Error: Unable to find type of '#{stringify(nameTree)}' on line #{nameTree.line} character #{nameTree.column}")
 	else
 		typTree
+
+
+definingTree = (tree) ->
+	if tree.type is "ID" or tree.type is "id"
+		if not tree.definingTree
+			requireMember(tree)   # do a lookup to ensure definingTree is set
+		tree.definingTree
+	else
+		throw new Error("Internal compiler error: Expected id/ID tree in definingTree, got '#{tree.type}' tree")
+
 
 replaceSelfWithPrefix = (typ, enclosing, prefix) ->
 	# replace all Ids where IdTree.definingTree == enclosing with TypeSelect(prefix, ID) or TermSelect(prefix, ID)
 	deepCopyTree(typ, (t) ->
 		if t.type is "ID"
-			requireMember(t)   # make sure definingTree is initialized for this ID
-			if t.definingTree is enclosing
-				log(types, "Replacing self.#{t.match} with #{prefix.stringify(0)}.#{t.match} where self:#{enclosing.stringify(0)}")
+			if definingTree(t) is enclosing
+				log(types, "Replacing #{enclosing.selfName}.#{t.match} with #{stringify(prefix)}.#{t.match} where #{enclosing.selfName}:#{stringify(enclosing)}")
 				t1 = shallowCopyTree(t)
 				t1.type = "TYPE-SELECT"
 				t1.ID = t.match
 				t1.prefix = prefix
-				t1.stringify = (indent) -> "#{t1.prefix.stringify(indent)}.#{t1.ID}"
+				t1.stringify = (indent) -> "#{stringify(t1.prefix, indent)}.#{t1.ID}"
 				return t1
 		if t.type is "id"
-			requireMember(t)   # make sure definingTree is initialized for this id
-			if t.definingTree is enclosing
-				log(types, "Replacing self.#{t.match} with #{prefix.stringify(0)}.#{t.match} where self:#{enclosing.stringify(0)}")
+			if definingTree(t) is enclosing
+				log(types, "Replacing #{enclosing.selfName}.#{t.match} with #{stringify(prefix)}.#{t.match} where #{enclosing.selfName}:#{stringify(enclosing)}")
 				t1 = shallowCopyTree(t)
 				t1.type = "TERM-SELECT"
 				t1.id = t.match
 				t1.prefix = prefix
-				t1.stringify = (indent) -> "##{t1.prefix.stringify(indent)}.{t1.id}"
+				t1.stringify = (indent) -> "#{stringify(t1.prefix, indent)}.#{t1.id}"
 				return t1
 		t
 	)
 
+replaceSelfWithSelf = (typ, enclosing, newEnclosing) ->
+
+	deepCopyTree(typ, (t) ->
+		if t.type is "ID" or t.type is "id"
+			if definingTree(t) is enclosing
+				t1 = shallowCopyTree(t)
+				t1.definingTree = newEnclosing
+				t1.match = t.match
+				return t1
+		t
+	)
 
 contextify = (tree, enclosingTree, freshTree) ->
 
@@ -426,9 +445,11 @@ contextify = (tree, enclosingTree, freshTree) ->
 
 ### TYPE COMPARISONS ###
 
-isSubType = (t0, ctx0, t1, ctx1) ->
+isSubType = (t0, t1) ->
 
-	log(types, "#{t0.stringify(0)} <:? #{t1.stringify(0)}")
+	log(types, "#{stringify(t0)} <:? #{stringify(t1)}")
+
+	#TODO: variance?
 
 	if t0 is t1
 		true
@@ -441,46 +462,43 @@ isSubType = (t0, ctx0, t1, ctx1) ->
 	else if t1 is Nothing
 		false
 
-	else if t1.type is "TYPE-SELECT"
-		# x.L <: x.L ; same prefix, same type member name
-		if t0.type is "TYPE-SELECT" and t0.ID is t1.ID and isSameReference(t0.prefix, ctx0, t1.prefix, ctx1)
-			true
-		else
-			# T <: x.L ; widen x.L to its lower bound ; substitute x for self-references in result type
-			[wctx1, wtyp1] = widen(t1.prefix, ctx1, true)
-			substThis()
-			isSubType(t0, ctx0, wtyp1, wctx1)
-
-	else if t1.type is "ID"
-		# x.L <: x.L ; same prefix, same type member name ; the "prefix" x here is the self-reference of the context defining the ID
-		if t0.type is "ID" and t0.match is t1.match and isDefinedInSameContext(t0, ctx0, t1, ctx1)
-			true
-		else
-			# T <: x.L ; widen x.L to its lower bound ; x is the context reference ctx1, so substitution of "this" is done by merely returning the right context
-			[wctx1, wtyp1] = widen(t1, ctx1, true)
-			isSubType(t0, ctx0, wtyp1, wctx1)
-
 	else if t1.type is "AND-TYPE"
-		isSubType(t0, ctx0, t1.lhs, ctx1) and isSubType(t0, ctx0, t1.rhs, ctx1)
+		isSubType(t0, t1.lhs) and isSubType(t0, t1.rhs)
 
 	else if t1.type is "OR-TYPE"
-		isSubType(t0, ctx0, t1.lhs, ctx1) or isSubType(t0, ctx0, t1.rhs, ctx1)
-
-	else if t0.type is "ID"
-		# x.L <: T ; widen x.L to its upper bound
-		[wctx0, wtyp0] = widen(t0, ctx0, false)
-		isSubType(wtyp0, wctx0, t1, ctx1)
-
-	else if t0.type is "TYPE-SELECT"
-		# x.L <: T ; widen x.L to its upper bound ; substitute x for self-references in result type
-		[wctx0, wtyp0] = widen(t0, ctx0, false)
-		isSubType(wtyp0, wctx0, t1, ctx1)
+		isSubType(t0 t1.lhs) or isSubType(t0, t1.rhs)
 
 	else if t0.type is "AND-TYPE"
-		isSubType(t0.lhs, ctx0, t1, ctx1) or isSubType(t0.rhs, ctx0, t1, ctx1)
+		isSubType(t0.lhs, t1) or isSubType(t0.rhs, t1)
 
 	else if t0.type is "OR-TYPE"
-		isSubType(t0.lhs, ctx0, t1, ctx1) and isSubType(t0.rhs, ctx0, t1, ctx1)
+		isSubType(t0.lhs, t1) and isSubType(t0.rhs, t1)
+
+	else if t1.type is "CONSTRUCT"
+		# Unpack constructor types
+		isSubType(t0, t1.typTree)
+
+	else if t0.type is "CONSTRUCT"
+		# Unpack constructor types
+		isSubType(t0.typTree, t1)
+
+	else if t1.type is "TYPE-SELECT" and t0.type is "TYPE-SELECT" and t0.ID is t1.ID and isSameReference(t0.prefix, t1.prefix)
+		# x.L <: x.L ; same prefix, same type member name
+		true
+
+	else if t1.type is "ID" and t0.type is "ID" and t0.match is t1.match and definingTree(t0) is definingTree(t1)
+		# x.L <: x.L ; same prefix, same type member name ; the "prefix" x here is the self-reference of the ID
+		true
+
+	else if t0.type is "TYPE-SELECT" or t0.type is "ID"
+		# x.L <: T ; widen x.L to its upper bound
+		t0upper = requireMember(t0, false)
+		isSubType(t0upper, t1)
+
+	else if t1.type is "TYPE-SELECT" or t1.type is "ID"
+		# T <: x.L ; widen x.L to its lower bound
+		t1lower = requireMember(t1, true)
+		isSubType(t0, t1lower)
 
 	else if not (t0.type is "STATEMENTS" and t1.type is "STATEMENTS")
 		throw new Error("Internal compiler error: Expected types in isSubType, but attempted to compare a #{t0.type} tree with a #{t1.type} tree")
@@ -490,62 +508,47 @@ isSubType = (t0, ctx0, t1, ctx1) ->
 		for st1 in t1.statements
 
 			if st1.type is "TYPE-DECL"
-				member0upper = findMember(st1.lhs, t0, ctx0, false)
-				if not member0upper
-					log(types, "Failure to find member #{st.lhs} in type #{t0}")
+				name1 = st1.lhs.match
+				st0upper = findMember(name1, t0, false)
+				st0lower = findMember(name1, t0, true)
+				if not st0upper
+					log(types, "isSubType: Failure to find member #{name1} in type #{stringify(t0)}")
 					return false
-				if not isSubType(member0upper, ctx0, st1.rhsUpper, ctx1)
-					log(types, "#{member0upper}, the upper bound of #{st1.lhs} in #{t0}, is not compatible with #{st1.rhsUpper}")
+				if not isSubType(st0upper, st1.rhsUpper)
+					log(types, "isSubType: #{stringify(st0upper)}, the upper bound of #{name1} in #{stringify(t0)}, is not compatible with #{stringify(st1.rhsUpper)}")
 					return false
-
-				member0lower = findMember(st1.lhs, t0, ctx0, true)
-				if not isSubType(st1.rhsLower, ctx1, member0lower, ctx0)
-					log(types, "#{st1.rhsLower} is not compatible with #{member0lower}, the lower bound of #{st1.lhs} in #{t0}")
+				if not isSubType(st1.rhsLower, st1lower)
+					log(types, "isSubType: #{stringify(st1.rhsLower)} is not compatible with #{stringify(st0lower)}, the lower bound of #{name1} in #{stringify(t0)}")
 					return false
 			
 			else if st1.type is "TERM-DECL"
-				member0 = findMember(st1.lhs, t0, ctx0, false)
+				name1 = st1.lhs.match
+				member0 = findMember(name1, t0)
 				if not member0
-					log(types, "Failure to find member #{st1.lhs} in type #{t0}")
+					log(types, "isSubType: Failure to find member #{name1} in type #{stringify(t0)}")
 					return false
-				if not isSubType(member0, ctx0, st1.rhs, ctx1)  # TODO: strengthen this condition when variance is added
-					log(types, "Type #{member0} declared for field #{st1.lhs} is not compatible with type #{st1.rhs}")
+				if not isSubType(member0, st1.rhs)  # TODO: strengthen this condition when variance is added
+					log(types, "isSubType: Type #{stringify(member0)} declared for field #{name1} is not compatible with type #{stringify(st1.rhs)}")
 					return false
-				if not isSubType(st1.rhs, ctx1, member0, ctx0)  # TODO: strengthen this condition when variance is added
-					log(types, "Type #{st1.rhs} declared for field #{st1.lhs} is not compatible with type #{member0}")
+				if not isSubType(st1.rhs, member0)  # TODO: strengthen this condition when variance is added
+					log(types, "isSubType: Type #{stringify(st1.rhs)} declared for field #{name1} is not compatible with type #{stringify(member0)}")
 					return false
 
 		# All declarations are compatible. Subtype check succeeds.
 		true
 
-
-isSameReference = (tree0, ctx0, tree1, ctx1) ->
+# an approximation of term equivalence
+isSameReference = (tree0, tree1) ->
 	if tree0.type is "id"
-		tree1.type is "id" and tree0.match is tree1.match and isDefinedInSameContext(tree0, ctx0, tree1, ctx1)
+		tree1.type is "id" and tree0.match is tree1.match and definingTree(tree0) is definingTree(tree1)
 	else if tree0.type is "TERM-SELECT"
-		tree1.type is "TERM-SELECT" and tree0.id is tree1.id and isSameReference(tree0.prefix, ctx0, tree1.prefix, ctx1)
+		tree1.type is "TERM-SELECT" and tree0.id is tree1.id and isSameReference(tree0.prefix, tree1.prefix)
+	else if tree0.type is "CONSTRUCT"
+		tree1.type is "CONSTRUCT" and tree0.typTree is tree1.typTree
 	else
-		false
+		throw new Error("Internal compiler error: Expected a term tree in isSameReference, got '#{tree0.type}' tree")
 
-isDefinedInSameContext = (tree0, ctx0, tree1, ctx1) ->
-	# assume tree0 and tree1 are both "id" or "ID" tokens
-	requireDefContext(tree0.match, ctx0, tree0) is requireDefContext(tree1.match, ctx1, tree1)
 
-requireCompatibility = (t0, ctx0, t1, ctx1, whereTree) ->
-	if isSubType(t0, ctx0, t1, ctx1)
-		true
-	else
-		throw new Error("Type error: expected: #{t1.stringify(0)}\n\tGot: #{t0.stringify(0)}\n\tOn line #{whereTree.line} character #{whereTree.column}")
-
-requireTermCompatibility = (tree0, tree1, ctx) ->
-	if not (tree0.type in ["id", "TERM-SELECT", "CONSTRUCT"])
-		throw new Error("Internal compiler error: Expected term in requireTermCompatibility, got #{tree0.type}")
-	if not (tree1.type in ["id", "TERM-SELECT", "CONSTRUCT"])
-		throw new Error("Internal compiler error: Expected term in requireTermCompatibility, got #{tree1.type}")
-	[ctx0, t0] = widen(tree0, ctx, false)
-	[ctx1, t1] = widen(tree1, ctx, false)
-	requireCompatibility(t0, ctx0, t1, ctx1, tree1)
-	log(types, "Successfully compared type #{t0.stringify(0)} to #{t1.stringify(0)} on line #{tree1.line}")
 
 ### CODEGEN ###
 
@@ -564,11 +567,14 @@ genProgram = (ast) ->
 	output.join("")
 
 genBaseCalls = (base, fresh, getId, indent, output) ->
+
 	if base.type is "STATEMENTS"
+
 		# hoist type-member initializers to top of statement block
 		for st in base.statements
 			if st.type is "TYPE-DECL"
 				genTypeInitializer(fresh, st.lhs.match, st.rhsLower, getId, indent + 1, output)
+
 		# generate executable terms
 		for st in base.statements
 			if st.type is "TERM-ASSIGN"
@@ -578,11 +584,19 @@ genBaseCalls = (base, fresh, getId, indent, output) ->
 				output.push(" = ")
 				gen(st.rhs, getId, indent + 1, output)
 				output.push(";\n")
+
+				# typecheck assignment
+				upperRhs = lookupMember(st.rhs, false)
+				lowerLhs = lookupMember(st.lhs, true)
+				if not isSubType(upperRhs, lowerLhs)
+					throw new Error("Type mismatch:\n\tExpected: #{stringify(lowerLhs, 1)}\n\tGot: #{stringify(upperRhs, 1)}\n\tLine #{st.line} character #{st.column}")
+
 			else if st.type in ["id", "TERM-SELECT", "CONSTRUCT"]
 				output.push(tabs(indent + 1))
 				maybeGenGuard(st, getId, indent + 1, output)
 				gen(st, getId, indent + 1, output)
 				output.push(";\n")
+
 	else if base.type is "ID"
 		if base.match isnt "Any"
 			requireMember(base, true)  # make sure definingTree is set
@@ -642,8 +656,7 @@ genTypeInitializer = (fresh, name, typTree, getId, indent, output) ->
 gen = (tree, getId, indent, output) ->
 
 	if tree.type is "id"
-		requireMember(tree)  # make sure definingTree is set
-		output.push(tree.definingTree.selfName)
+		output.push(definingTree(tree).selfName)
 		output.push(".")
 		output.push(tree.match)
 
@@ -659,6 +672,54 @@ gen = (tree, getId, indent, output) ->
 		throw new Error("Internal compiler error: Expected term tree in gen function, got #{tree.type} tree")
 
 
+### PRINTING ###
+
+stringify = (t, indent = 0) ->
+
+	if t.type is "id" or t.type is "ID"
+		prefix =
+			if t.definingTree
+				if t.definingTree.selfName
+					t.definingTree.selfName + "."
+				else
+					"<<unnamed>>."
+			else if t.enclosing
+				"<<#{t.enclosing.selfName} or enclosing>>."
+			else
+				""
+		"#{prefix}#{t.match}"
+
+	else if t.type is "TERM-SELECT"
+		"#{stringify(t.prefix, indent)}.#{t.id}"
+
+	else if t.type is "TYPE-SELECT"
+		"#{stringify(t.prefix, indent)}.#{t.ID}"
+
+	else if t.type is "CONSTRUCT"
+		stringify(t.typTree, indent) + ".new"
+
+	else if t.type is "TERM-DECL"
+		"#{stringify(t.lhs, indent)} : #{stringify(t.rhs, indent)}"
+
+	else if t.type is "TYPE-DECL"
+		"#{stringify(t.lhs, indent)} : at least #{stringify(t.rhsLower, indent)} at most #{stringify(t.rhsUpper, indent)}"
+
+	else if t.type is "STATEMENTS"
+		stringifyStatements(t, indent)
+
+	else if t.stringify
+		t.stringify(indent)
+
+	else
+		"<< #{t.type} tree >>"
+
+stringifyStatements = (stmts, indent) ->
+	"{\n" +
+		(for stmt in stmts.statements
+			tabs(indent + 1) + stringify(stmt, indent + 1) + "\n").join("") +
+		tabs(indent) + "}"
+
+tabs = (indent) -> "\t".repeat(indent)
 
 ### PARSER ###
 
@@ -1229,12 +1290,3 @@ tokenize = (input) ->
 		if t.type == "EOF" then break
 
 	tokens
-
-
-stringifyStatements = (stmts, indent) ->
-	"{\n" +
-		(for stmt in stmts.statements
-			tabs(indent + 1) + stmt.stringify(indent + 1) + "\n").join("") +
-		tabs(indent) + "}"
-
-tabs = (indent) -> "\t".repeat(indent)

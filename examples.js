@@ -4,13 +4,13 @@
     if (exampleName === "") {
 
     } else if (exampleName === "Path-dependent Type Selection") {
-      return targetElement.value = "X:{\n\	Y:at most Any\n\	y:Y\n}\nx:X\ny:x.Y\ny = x.y\n";
+      return targetElement.value = "X:{\n\	Y:at most Any\n\	y:Y\n}\nx:X\ny:x.Y\ny = x.y\n\n// Uncomment line below for type error\nx1:X\nx2:X\n//x2.y = x1.y\n";
     } else if (exampleName === "Method Type Invocation") {
-      return targetElement.value = "// Define method Ident\nIdent: at least {\n\	p: T\n\	result: T\n\	result = p\n}\n\n// Call method Ident\nx: T\n{ p = x } & Ident . new . result\n";
+      return targetElement.value = "// Define method Ident\nIdent: at least {\n\	p: Any\n\	result: Any\n\	result = p\n}\n\n// Call method Ident\nx: Any\n{ p = x } & Ident . new . result\n";
     } else if (exampleName === "Polymorphic Method Invocation") {
       return targetElement.value = "// Declare polymorphic method Ident\nIdent: at least {\n\	T: at least Nothing at most Any\n\	param: T\n\	result: T\n\	result = param  // assign result\n}\n\nV: { u: Any }  // declare V with field u\n\n// Call Ident with member T = V\n{\n\	T: V\n\	param = T.new\n} & Ident.new.result.u  // read field u\n";
     } else if (exampleName === "WIP-1") {
-      return targetElement.value = "X: {\n\	Y: {\n\		x:X\n\		x = Y.new\n\	}\n\	x:X\n}\n\nx:X\nX.new.x = x\nX.new.Y | {\n\	x: X\n\	x\n}.new\n";
+      return targetElement.value = "X: {\n\	Y: {\n\		x:X\n\		x = X.new\n\	}\n\	x:X\n}\n\nx:X\nX.new.x = x\nX.new.Y | {\n\	x: X\n\	x\n}.new\n";
     } else {
       return alert("Unknown example name '" + exampleName + "'");
     }

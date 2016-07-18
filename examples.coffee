@@ -13,19 +13,24 @@ window.showExample = (exampleName, targetElement) ->
 			x:X\n\
 			y:x.Y\n\
 			y = x.y\n\
+			\n\
+			// Uncomment line below for type error\n\
+			x1:X\n\
+			x2:X\n\
+			//x2.y = x1.y\n\
 			"
 
 	else if exampleName is "Method Type Invocation"
 		targetElement.value = "\
 			// Define method Ident\n\
 			Ident: at least {\n\
-			\	p: T\n\
-			\	result: T\n\
+			\	p: Any\n\
+			\	result: Any\n\
 			\	result = p\n\
 			}\n\
 			\n\
 			// Call method Ident\n\
-			x: T\n\
+			x: Any\n\
 			{ p = x } & Ident . new . result\n\
 			"
 
@@ -53,7 +58,7 @@ window.showExample = (exampleName, targetElement) ->
 			X: {\n\
 			\	Y: {\n\
 			\		x:X\n\
-			\		x = Y.new\n\
+			\		x = X.new\n\
 			\	}\n\
 			\	x:X\n\
 			}\n\
